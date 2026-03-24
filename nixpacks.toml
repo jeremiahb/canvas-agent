@@ -2,7 +2,7 @@
 nixPkgs = ["python311", "nodejs_20", "chromium", "nss", "nspr", "alsa-lib", "atk", "cups", "dbus", "expat", "libdrm", "libxkbcommon", "mesa", "libGL", "gtk3", "pango", "cairo", "gdk-pixbuf", "xorg.libX11", "xorg.libXcomposite", "xorg.libXdamage", "xorg.libXext", "xorg.libXfixes", "xorg.libXrandr", "xorg.libxcb"]
 
 [phases.install]
-cmds = ["pip3 install -r requirements.txt"]
+cmds = ["python3 -m pip install -r requirements.txt"]
 
 [phases.build]
 cmds = ["cd dashboard && npm install && npm run build && cp -r build ../dashboard/build"]
