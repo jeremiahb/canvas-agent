@@ -29,8 +29,11 @@ logger = logging.getLogger(__name__)
 
 CANVAS_URL = os.environ.get("CANVAS_URL", "https://wilmu.instructure.com").rstrip("/")
 
-_MIN_DELAY = 1.5
-_MAX_DELAY = 3.5
+_MIN_DELAY = 0.8
+_MAX_DELAY = 1.8
+
+# Course name fragments to skip — admin/orientation courses with no real assignments
+_SKIP_COURSE_FRAGMENTS = ["BrushUp", "Student Assistance", "Orientation", "Tutorial"]
 
 
 async def _polite_goto(page: Page, url: str) -> None:
@@ -224,17 +227,9 @@ class CanvasCrawler:
     async def get_assignments(self, course_id: str) -> list:
         """Return all assignments for a course."""
         await self._goto(f"{self.base_url}/courses/{course_id}/assignments")
-
-        # Canvas assignments page is React-rendered — wait for the assignment
-        # groups to actually appear in the DOM, up to 10 seconds.
-        try:
-            await self.page.wait_for_selector(
-                ".assignment-group, .ig-row, [data-view='assignment']",
-                timeout=10000
-            )
-        except Exception:
-            logger.warning(f"Assignments selector not found for course {course_id} — page may be empty or still loading")
-            await self.page.wait_for_timeout(3000)
+        # Wait briefly for React to render — primary selector often doesn't appear
+        # so we proceed quickly to the link fallback which always works
+        await self.page.wait_for_timeout(1500)
 
         assignments = []
 
@@ -263,9 +258,9 @@ class CanvasCrawler:
                     except Exception as e:
                         logger.warning(f"Error parsing assignment item: {e}")
 
-        # Fallback: scan all assignment links directly from the page
+        # Fallback: scan all assignment links directly — always works regardless of CSS class
         if not assignments:
-            logger.info(f"Primary selector found nothing for {course_id}, trying link fallback")
+            logger.info(f"Using link fallback for course {course_id}")
             links = await self.page.query_selector_all("a[href*='/assignments/']")
             seen = set()
             for link in links:
@@ -273,7 +268,6 @@ class CanvasCrawler:
                     href = await link.get_attribute("href") or ""
                     if "/assignments/" not in href or href in seen:
                         continue
-                    # Skip syllabus and submission links
                     if "syllabus" in href or "submissions" in href:
                         continue
                     seen.add(href)
@@ -488,6 +482,12 @@ class CanvasCrawler:
         for course in courses:
             cid = course["id"]
             slug = re.sub(r"[^\w]", "_", course["name"])[:30]
+
+            # Skip admin/orientation courses — no real assignments
+            if any(f.lower() in course["name"].lower() for f in _SKIP_COURSE_FRAGMENTS):
+                logger.info(f"[SKIP] {course['name']} — non-academic course")
+                continue
+
             logger.info(f"[CRAWL] {course['name']}")
 
             course["syllabus"] = await self.get_syllabus(cid)
@@ -506,9 +506,12 @@ class CanvasCrawler:
             await self._save_page_snapshot(f"{slug}_{cid}_assignments")
             logger.info(f"  Found {len(assignments)} assignments")
 
+            # Skip per-assignment detail pages during bulk crawl — they each cost
+            # a full page navigation + delay. Details are fetched on-demand when
+            # the user generates a specific assignment.
             for a in assignments:
-                logger.info(f"  -> {a['title']} (due: {a['due']})")
-                a["details"] = await self.get_assignment_details(a["url"])
+                logger.info(f"  -> {a['title']}")
+                a["details"] = {}  # populated on-demand via get_assignment_details()
 
             course["assignments"] = assignments
 

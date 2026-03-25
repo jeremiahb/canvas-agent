@@ -399,17 +399,39 @@ function AssignmentsPanel({ api }) {
       </div>
 
       {tab === "upcoming" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <div>
           {assignments.length === 0 && <EmptyState label="No assignments found. Run a crawl first." />}
-          {assignments.map((a, i) => (
-            <div key={i} style={{ padding: 16, background: "#1f2937", borderRadius: 12, display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-              <div>
-                <div style={{ fontWeight: 600, fontSize: 14, color: "#f9fafb" }}>{a.metadata?.title}</div>
-                <div style={{ fontSize: 12, color: "#6b7280", marginTop: 4 }}>{a.metadata?.course_name} · Due: {a.metadata?.due}</div>
+          {Object.entries(
+            assignments.reduce((acc, a) => {
+              const c = a.metadata?.course_name || "Unknown";
+              if (!acc[c]) acc[c] = [];
+              acc[c].push(a);
+              return acc;
+            }, {})
+          ).map(([courseName, items]) => (
+            <div key={courseName} style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", textTransform: "uppercase",
+                letterSpacing: "0.08em", marginBottom: 8, paddingBottom: 6,
+                borderBottom: "1px solid #1f2937" }}>
+                {courseName} ({items.length})
               </div>
-              <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-                <Btn small onClick={() => analyze(a)}>Analyze</Btn>
-                <Btn small onClick={() => generate(a)} disabled={generating}>Generate</Btn>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {items.map((a, i) => (
+                  <div key={i} style={{ padding: 14, background: "#1f2937", borderRadius: 10,
+                    display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div>
+                      <div style={{ fontWeight: 500, fontSize: 13, color: "#f9fafb" }}>{a.metadata?.title}</div>
+                      <div style={{ fontSize: 11, color: "#6b7280", marginTop: 3 }}>
+                        Due: {a.metadata?.due || "No due date"}
+                        {a.metadata?.points ? ` · ${a.metadata.points}` : ""}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+                      <Btn small onClick={() => analyze(a)}>Analyze</Btn>
+                      <Btn small onClick={() => generate(a)} disabled={generating}>Generate</Btn>
+                    </div>
+                  </div>
+                ))}
               </div>
             </div>
           ))}
@@ -500,24 +522,55 @@ function KnowledgePanel({ api }) {
     a.metadata?.course_name?.toLowerCase().includes(filter.toLowerCase())
   );
 
+  // Group by course_name
+  const grouped = filtered.reduce((acc, a) => {
+    const course = a.metadata?.course_name || "Unknown Course";
+    if (!acc[course]) acc[course] = [];
+    acc[course].push(a);
+    return acc;
+  }, {});
+
   return (
     <div>
       <input value={filter} onChange={(e) => setFilter(e.target.value)}
         placeholder="Filter by course or title…"
         style={{ width: "100%", padding: "10px 14px", background: "#1f2937", border: "1px solid #374151",
           borderRadius: 8, color: "#f9fafb", fontSize: 13, fontFamily: "inherit",
-          marginBottom: 16, boxSizing: "border-box" }} />
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {filtered.length === 0 && <EmptyState label="No knowledge found. Run a crawl to populate." />}
-        {filtered.map((a, i) => (
-          <div key={i} style={{ padding: "12px 16px", background: "#1f2937", borderRadius: 10 }}>
-            <div style={{ fontSize: 13, fontWeight: 600, color: "#f9fafb" }}>{a.metadata?.title}</div>
-            <div style={{ fontSize: 12, color: "#6b7280", marginTop: 2 }}>
-              {a.metadata?.course_name} · Due: {a.metadata?.due} · {a.metadata?.points}
-            </div>
+          marginBottom: 20, boxSizing: "border-box" }} />
+
+      {Object.keys(grouped).length === 0 && <EmptyState label="No knowledge found. Run a crawl to populate." />}
+
+      {Object.entries(grouped).map(([courseName, items]) => (
+        <div key={courseName} style={{ marginBottom: 24 }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", textTransform: "uppercase",
+            letterSpacing: "0.08em", marginBottom: 8, paddingBottom: 6,
+            borderBottom: "1px solid #1f2937" }}>
+            {courseName} ({items.length})
           </div>
-        ))}
-      </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {items.map((a, i) => (
+              <div key={i} style={{ padding: "10px 14px", background: "#1f2937", borderRadius: 8,
+                display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 500, color: "#f9fafb" }}>{a.metadata?.title}</div>
+                  <div style={{ fontSize: 11, color: "#6b7280", marginTop: 2 }}>
+                    Due: {a.metadata?.due || "No due date"}
+                    {a.metadata?.points ? ` · ${a.metadata.points}` : ""}
+                  </div>
+                </div>
+                <div style={{ fontSize: 11, padding: "3px 10px", borderRadius: 20, flexShrink: 0,
+                  background: a.metadata?.status === "submitted" ? "#14532d44" :
+                               a.metadata?.status === "approved" ? "#1e3a5f44" : "#1f2937",
+                  color: a.metadata?.status === "submitted" ? "#22c55e" :
+                         a.metadata?.status === "approved" ? "#60a5fa" : "#6b7280",
+                  border: "1px solid currentColor" }}>
+                  {a.metadata?.status || "pending"}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
