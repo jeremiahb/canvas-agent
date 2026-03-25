@@ -293,18 +293,28 @@ async def upload_cookies(file: UploadFile = File(...)):
         raise HTTPException(400, "Cookie file exceeds 1 MB limit")
 
     try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        raise HTTPException(400, "File is not valid JSON")
+    data = json.loads(content)
+except json.JSONDecodeError:
+    raise HTTPException(400, "File is not valid JSON")
 
-    if not isinstance(data.get("cookies"), list):
-        raise HTTPException(400, "Invalid cookie file: 'cookies' must be a list")
+if isinstance(data, list):
+    data = {
+        "canvas_url": "https://wilmu.instructure.com",
+        "exported_at": None,
+        "cookies": data,
+    }
 
-    if len(data["cookies"]) == 0:
-        raise HTTPException(400, "Cookie list is empty -- log into Canvas first")
+if not isinstance(data, dict):
+    raise HTTPException(400, "Invalid cookie file: top level JSON must be an object")
 
-    COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    COOKIE_PATH.write_bytes(content)
+if not isinstance(data.get("cookies"), list):
+    raise HTTPException(400, "Invalid cookie file: 'cookies' must be a list")
+
+if len(data["cookies"]) == 0:
+    raise HTTPException(400, "Cookie list is empty -- log into Canvas first")
+
+COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
+COOKIE_PATH.write_text(json.dumps(data, indent=2))
 
     return {"message": f"Cookies uploaded successfully ({len(data['cookies'])} cookies)"}
 
