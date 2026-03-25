@@ -5,7 +5,7 @@ nixPkgs = ["python311", "nodejs_20", "chromium", "nss", "nspr", "alsa-lib", "atk
 cmds = ["python3 -m venv /opt/venv && /opt/venv/bin/pip install -r requirements.txt"]
 
 [phases.build]
-cmds = ["cd dashboard && npm install && npm run build && rm -rf /app/dashboard/build && cp -r build /app/dashboard/build"]
+cmds = ["cd dashboard && npm install && npm run build && mv build /tmp/dashboard_build && mv /tmp/dashboard_build /app/dashboard/build"]
 
 [start]
 cmd = "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=$(which chromium) /opt/venv/bin/uvicorn api.main:app --host 0.0.0.0 --port $PORT"
