@@ -104,7 +104,16 @@ class CanvasCrawler:
     async def start(self, headless: bool = True) -> None:
         """Launch headless Chromium and inject Canvas session cookies."""
         self._pw = await async_playwright().start()
-        browser = await self._pw.chromium.launch(headless=headless)
+
+        # If PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH is set (e.g. pointing to the
+        # Nix-installed chromium on Railway), use it directly so we don't depend
+        # on Playwright's own downloaded browser binary which may be missing libs.
+        executable_path = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or None
+
+        browser = await self._pw.chromium.launch(
+            headless=headless,
+            executable_path=executable_path,
+        )
         self.context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

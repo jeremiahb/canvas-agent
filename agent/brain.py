@@ -38,23 +38,49 @@ logger = logging.getLogger(__name__)
 _client: Optional[Anthropic] = None
 
 
-def _get_client() -> Anthropic:
+def _get_client():
     """
-    Return the Anthropic client, building it on first call.
-    Raises a clear RuntimeError if the API key is missing.
-    Lazy initialisation means the import never crashes during Railway's
-    build phase, CI runs, or tests that don't exercise the AI path.
+    Return an AI client on first call, lazy-initialised.
+    Supports both Anthropic and OpenRouter. OpenRouter is checked first
+    since that is the recommended starting point for new deployments.
+
+    OpenRouter: set OPENROUTER_API_KEY and AI_MODEL in Railway Variables.
+    Anthropic:  set ANTHROPIC_API_KEY and AI_MODEL in Railway Variables.
     """
     global _client
-    if _client is None:
-        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-        if not key:
+    if _client is not None:
+        return _client
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    anthropic_key  = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+
+    if openrouter_key:
+        # OpenRouter exposes an OpenAI-compatible API so we use the openai package.
+        # It is already installed as a transitive dependency of chromadb.
+        try:
+            from openai import AsyncOpenAI  # noqa: F401 — import check only
+            from openai import OpenAI
+        except ImportError:
             raise RuntimeError(
-                "ANTHROPIC_API_KEY environment variable is not set. "
-                "Add it to your Railway variables or .env file."
+                "The 'openai' package is required for OpenRouter. "
+                "Add openai>=1.0.0 to requirements.txt."
             )
-        _client = Anthropic(api_key=key)
-    return _client
+        _client = OpenAI(
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+        logger.info(f"AI client: OpenRouter / {_AI_MODEL}")
+        return _client
+
+    if anthropic_key:
+        _client = Anthropic(api_key=anthropic_key)
+        logger.info(f"AI client: Anthropic / {_AI_MODEL}")
+        return _client
+
+    raise RuntimeError(
+        "No AI API key found. Set either OPENROUTER_API_KEY (recommended) "
+        "or ANTHROPIC_API_KEY in your Railway Variables."
+    )
 
 
 # RF-ModelConst: single source of truth for the model string
@@ -92,23 +118,56 @@ Current date context and course knowledge will be provided in each message.
 """
 
 
-def _extract_text(response: Message) -> str:
+def _extract_text(response) -> str:
     """
-    Safely extract the first text block from an Anthropic response.
-    RF-ContentIdx: guards against empty content or non-text blocks,
-    raising a clear ValueError instead of an opaque IndexError.
+    Safely extract text from either an Anthropic or OpenRouter/OpenAI response.
+    - Anthropic: response.content is a list of blocks with .type and .text
+    - OpenRouter/OpenAI: response.choices[0].message.content is a string
     """
+    # OpenAI / OpenRouter format
+    if hasattr(response, "choices"):
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError(
+                f"Empty content in OpenRouter response. "
+                f"finish_reason={response.choices[0].finish_reason}"
+            )
+        return content
+
+    # Anthropic format
     text_blocks = [b for b in response.content if b.type == "text"]
     if not text_blocks:
         raise ValueError(
-            f"No text block in API response. "
+            f"No text block in Anthropic response. "
             f"stop_reason={response.stop_reason}, "
             f"content_types={[b.type for b in response.content]}"
         )
     return text_blocks[0].text
 
 
-class AgentBrain:
+def _call_api(system: str, messages: list, max_tokens: int = 2048):
+    """
+    Make a completion call to whichever provider is configured.
+    Anthropic and OpenRouter have different call signatures — this
+    normalises them so callers don't need to care.
+    """
+    client = _get_client()
+
+    # OpenRouter / OpenAI format
+    if hasattr(client, "chat"):
+        return client.chat.completions.create(
+            model=_AI_MODEL,
+            max_tokens=max_tokens,
+            messages=[{"role": "system", "content": system}] + messages,
+        )
+
+    # Anthropic format
+    return client.messages.create(
+        model=_AI_MODEL,
+        max_tokens=max_tokens,
+        system=system,
+        messages=messages,
+    )
     def __init__(self, kb: KnowledgeBase):
         self.kb = kb
         self.conversation_history: list[dict] = []
@@ -238,11 +297,10 @@ class AgentBrain:
         self.conversation_history.append({"role": "user", "content": user_message})
         self._trim_history()
 
-        response = _get_client().messages.create(  # RF-LazyClient, RF-ModelConst
-            model=_AI_MODEL,
-            max_tokens=4096,
+        response = _call_api(  # RF-LazyClient, RF-ModelConst
             system=system,
             messages=self.conversation_history,
+            max_tokens=4096,
         )
 
         reply = _extract_text(response)  # RF-ContentIdx
@@ -275,14 +333,13 @@ class AgentBrain:
             "Respond ONLY with valid JSON, no markdown fences."
         )
 
-        response = _get_client().messages.create(  # RF-LazyClient, RF-ModelConst
-            model=_AI_MODEL,
-            max_tokens=2048,
+        response = _call_api(
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048,
         )
 
-        raw = _extract_text(response)  # RF-ContentIdx
+        raw = _extract_text(response)
         clean = raw.replace("```json", "").replace("```", "").strip()
 
         try:
@@ -325,14 +382,13 @@ class AgentBrain:
             "For TEXT: Write the complete response"
         )
 
-        response = _get_client().messages.create(  # RF-LazyClient, RF-ModelConst
-            model=_AI_MODEL,
-            max_tokens=8096,
+        response = _call_api(
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
+            max_tokens=8096,
         )
 
-        return _extract_text(response)  # RF-ContentIdx
+        return _extract_text(response)
 
     def generate_daily_briefing(self) -> str:
         """Generate a personalised daily briefing: priorities, upcoming, recommendations."""
@@ -357,14 +413,13 @@ class AgentBrain:
             "Keep it actionable and concise."
         )
 
-        response = _get_client().messages.create(  # RF-LazyClient, RF-ModelConst
-            model=_AI_MODEL,
-            max_tokens=1024,
+        response = _call_api(
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
         )
 
-        return _extract_text(response)  # RF-ContentIdx
+        return _extract_text(response)
 
     # ------------------------------------------------------------------ #
     #  Self-improvement                                                    #
@@ -388,14 +443,13 @@ class AgentBrain:
             "Return ONLY a valid JSON array of proposal objects, no markdown fences."
         )
 
-        response = _get_client().messages.create(  # RF-LazyClient, RF-ModelConst
-            model=_AI_MODEL,
-            max_tokens=2048,
+        response = _call_api(
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048,
         )
 
-        raw = _extract_text(response)  # RF-ContentIdx
+        raw = _extract_text(response)
         clean = raw.replace("```json", "").replace("```", "").strip()
 
         try:
