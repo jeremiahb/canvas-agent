@@ -172,7 +172,10 @@ class CanvasCrawler:
 
     async def get_courses(self) -> list:
         """Return all active enrolled courses from the Canvas dashboard."""
-        await self._goto(f"{self.base_url}/courses")
+        # Canvas dashboard cards are at the root URL, not /courses.
+        # /courses shows an enrollment list without the ic-DashboardCard elements.
+        await self._goto(f"{self.base_url}/")
+        await self.page.wait_for_timeout(2000)  # cards load via JS after networkidle
 
         courses = []
         for card in await self.page.query_selector_all(".ic-DashboardCard"):
