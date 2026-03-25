@@ -168,6 +168,9 @@ def _call_api(system: str, messages: list, max_tokens: int = 2048):
         system=system,
         messages=messages,
     )
+
+
+class AgentBrain:
     def __init__(self, kb: KnowledgeBase):
         self.kb = kb
         self.conversation_history: list[dict] = []
