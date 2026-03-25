@@ -8,4 +8,4 @@ cmds = ["python3 -m venv /opt/venv && /opt/venv/bin/pip install -r requirements.
 cmds = ["cd dashboard && npm install && npm run build && mv build /tmp/dashboard_build && mv /tmp/dashboard_build /app/dashboard/build"]
 
 [start]
-cmd = "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=$(which chromium) /opt/venv/bin/uvicorn api.main:app --host 0.0.0.0 --port $PORT"
+cmd = "/opt/venv/bin/uvicorn api.main:app --host 0.0.0.0 --port $PORT"
