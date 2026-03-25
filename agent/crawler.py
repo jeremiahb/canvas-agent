@@ -92,9 +92,19 @@ class CanvasCrawler:
         if not isinstance(data.get("cookies"), list):
             raise ValueError("Cookie file is missing a valid 'cookies' list")
 
+        # Map Chrome extension sameSite values to Playwright-accepted values.
+        # Chrome uses "no_restriction" / "lax" / "strict" / "unspecified".
+        # Playwright requires exactly "None" / "Lax" / "Strict".
+        SAME_SITE_MAP = {
+            "no_restriction": "None",
+            "lax":            "Lax",
+            "strict":         "Strict",
+            "unspecified":    "Lax",
+        }
         cleaned = []
         for c in data["cookies"]:
-            c.setdefault("sameSite", "Lax")
+            raw_ss = (c.get("sameSite") or "").lower()
+            c["sameSite"] = SAME_SITE_MAP.get(raw_ss, "Lax")
             if c.get("expires") is not None and c["expires"] < 0:
                 c.pop("expires")
             cleaned.append(c)
