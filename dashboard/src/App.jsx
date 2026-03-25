@@ -147,6 +147,7 @@ const NAV = [
   { id: "documents",   label: "Documents"    },
   { id: "voice",       label: "Voice & Style"},
   { id: "system",      label: "System"       },
+  { id: "snapshots",   label: "Snapshots"    },
 ];
 
 // ------------------------------------------------------------------ //
@@ -724,6 +725,31 @@ function SystemPanel({ api, onSignOut }) {
   const [proposals, setProposals] = useState([]);
   const [log, setLog] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [currentModel, setCurrentModel] = useState("");
+  const [models, setModels] = useState([]);
+  const [switching, setSwitching] = useState(false);
+  const [switchMsg, setSwitchMsg] = useState("");
+
+  useEffect(() => {
+    api.get("/improvements/log").then((r) => setLog(r.log || [])).catch(() => {});
+    api.get("/settings/model").then((r) => {
+      setCurrentModel(r.current || "");
+      setModels(r.models || []);
+    }).catch(() => {});
+  }, [api]);
+
+  const switchModel = async (modelId) => {
+    setSwitching(true);
+    setSwitchMsg("");
+    try {
+      const res = await api.post("/settings/model", { model_id: modelId });
+      setCurrentModel(res.current);
+      setSwitchMsg(`Switched to ${res.current}`);
+    } catch (e) {
+      setSwitchMsg("Failed to switch model");
+    }
+    setSwitching(false);
+  };
 
   const loadProposals = async () => {
     setLoading(true);
@@ -732,12 +758,52 @@ function SystemPanel({ api, onSignOut }) {
     setLoading(false);
   };
 
-  useEffect(() => {
-    api.get("/improvements/log").then((r) => setLog(r.log || [])).catch(() => {});
-  }, [api]);
-
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
+
+      <Section title="AI Model">
+        <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 14 }}>
+          Switch models instantly — takes effect on the next message. No restart needed.
+        </p>
+        {models.map((m) => (
+          <div key={m.id} onClick={() => !switching && switchModel(m.id)}
+            style={{
+              padding: "10px 14px", borderRadius: 8, marginBottom: 6, cursor: switching ? "default" : "pointer",
+              background: currentModel === m.id ? "#1d3a6e" : "#111827",
+              border: `1px solid ${currentModel === m.id ? "#1d4ed8" : "#1f2937"}`,
+              display: "flex", alignItems: "center", justifyContent: "space-between",
+            }}>
+            <div>
+              <div style={{ fontSize: 13, color: "#f9fafb", fontFamily: "monospace" }}>{m.id}</div>
+              <div style={{ fontSize: 11, color: "#6b7280", marginTop: 2 }}>{m.label}</div>
+            </div>
+            {currentModel === m.id && (
+              <div style={{ fontSize: 11, color: "#60a5fa", fontWeight: 600, flexShrink: 0 }}>ACTIVE</div>
+            )}
+          </div>
+        ))}
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 6 }}>Or enter a custom model ID:</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              id="custom-model-input"
+              placeholder="e.g. anthropic/claude-3.5-sonnet"
+              style={{ ...inputStyle, flex: 1 }}
+              defaultValue=""
+            />
+            <Btn small onClick={() => {
+              const v = document.getElementById("custom-model-input").value.trim();
+              if (v) switchModel(v);
+            }} disabled={switching}>
+              Set
+            </Btn>
+          </div>
+        </div>
+        {switchMsg && (
+          <div style={{ fontSize: 12, color: "#22c55e", marginTop: 8 }}>{switchMsg}</div>
+        )}
+      </Section>
+
       <Section title="Self-Improvement Proposals">
         <Btn onClick={loadProposals} disabled={loading} style={{ marginBottom: 12 }}>
           {loading ? "Analyzing…" : "Generate Improvement Proposals"}
@@ -816,6 +882,83 @@ function EmptyState({ label }) {
 }
 
 // ------------------------------------------------------------------ //
+// Snapshots panel
+// ------------------------------------------------------------------ //
+function SnapshotsPanel({ api }) {
+  const [snapshots, setSnapshots] = useState([]);
+  const [viewing, setViewing] = useState(null);
+  const [html, setHtml] = useState("");
+
+  useEffect(() => {
+    api.get("/snapshots").then((r) => setSnapshots(r.snapshots || [])).catch(() => {});
+  }, [api]);
+
+  const view = async (name) => {
+    setViewing(name);
+    setHtml("Loading...");
+    try {
+      const res = await fetch(`/api/snapshots/${name}`, {
+        headers: { "X-Api-Key": getStoredKey() },
+      });
+      const text = await res.text();
+      setHtml(text);
+    } catch (e) {
+      setHtml("Failed to load snapshot.");
+    }
+  };
+
+  return (
+    <div>
+      <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 16 }}>
+        HTML snapshots saved during the last crawl. Use these to inspect what Canvas
+        is actually rendering and verify CSS selectors.
+      </p>
+
+      {snapshots.length === 0 && <EmptyState label="No snapshots yet. Run a crawl first." />}
+
+      <div style={{ display: "flex", gap: 16 }}>
+        <div style={{ width: 280, flexShrink: 0 }}>
+          {snapshots.map((s) => (
+            <div key={s.name} onClick={() => view(s.name)}
+              style={{
+                padding: "10px 14px", borderRadius: 8, marginBottom: 6, cursor: "pointer",
+                background: viewing === s.name ? "#1d3a6e" : "#1f2937",
+                border: `1px solid ${viewing === s.name ? "#1d4ed8" : "transparent"}`,
+              }}>
+              <div style={{ fontSize: 12, color: "#f9fafb", fontFamily: "monospace", wordBreak: "break-all" }}>
+                {s.name}
+              </div>
+              <div style={{ fontSize: 11, color: "#6b7280", marginTop: 2 }}>{s.size_kb} KB</div>
+            </div>
+          ))}
+        </div>
+
+        {viewing && (
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+              <div style={{ fontSize: 13, color: "#f9fafb", fontFamily: "monospace" }}>{viewing}.html</div>
+              <button onClick={() => { setViewing(null); setHtml(""); }}
+                style={{ background: "none", border: "none", color: "#6b7280", cursor: "pointer", fontSize: 12 }}>
+                Close
+              </button>
+            </div>
+            <iframe
+              srcDoc={html}
+              style={{
+                width: "100%", height: "70vh", border: "1px solid #374151",
+                borderRadius: 8, background: "#fff",
+              }}
+              sandbox="allow-same-origin"
+              title={viewing}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ //
 // Root App
 // ------------------------------------------------------------------ //
 export default function App() {
@@ -861,6 +1004,7 @@ export default function App() {
     documents:   <DocumentsPanel   api={api} />,
     voice:       <VoicePanel       api={api} />,
     system:      <SystemPanel      api={api} onSignOut={signOut} />,
+    snapshots:   <SnapshotsPanel   api={api} />,
   };
 
   return (

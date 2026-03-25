@@ -38,6 +38,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from agent.brain import AgentBrain
+import agent.brain as brain_module
 from agent.crawler import CanvasCrawler
 from agent.document_ingester import extract_text_from_bytes  # RF-InlineImport
 from agent.file_generator import generate_file
@@ -297,16 +298,6 @@ async def upload_cookies(file: UploadFile = File(...)):
     except json.JSONDecodeError:
         raise HTTPException(400, "File is not valid JSON")
 
-    if isinstance(data, list):
-        data = {
-            "canvas_url": "https://wilmu.instructure.com",
-            "exported_at": None,
-            "cookies": data,
-        }
-
-    if not isinstance(data, dict):
-        raise HTTPException(400, "Invalid cookie file: top level JSON must be an object")
-
     if not isinstance(data.get("cookies"), list):
         raise HTTPException(400, "Invalid cookie file: 'cookies' must be a list")
 
@@ -314,7 +305,7 @@ async def upload_cookies(file: UploadFile = File(...)):
         raise HTTPException(400, "Cookie list is empty -- log into Canvas first")
 
     COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    COOKIE_PATH.write_text(json.dumps(data, indent=2))
+    COOKIE_PATH.write_bytes(content)
 
     return {"message": f"Cookies uploaded successfully ({len(data['cookies'])} cookies)"}
 
@@ -746,6 +737,69 @@ async def get_improvement_proposals():
 @app.get("/api/improvements/log")
 async def get_improvement_log():
     return {"log": brain.improvement_log}
+
+
+# ------------------------------------------------------------------ #
+#  Model settings                                                      #
+# ------------------------------------------------------------------ #
+
+
+class ModelSwitch(BaseModel):
+    model_id: str
+
+
+@app.get("/api/settings/model")
+async def get_current_model():
+    """Return the currently active model and the list of known models."""
+    return {
+        "current": brain_module._AI_MODEL,
+        "models": brain_module.FREE_MODELS,
+    }
+
+
+@app.post("/api/settings/model")
+async def switch_model(body: ModelSwitch):
+    """Switch the active AI model at runtime. Takes effect immediately."""
+    if not body.model_id.strip():
+        raise HTTPException(400, "model_id cannot be empty")
+    brain_module.set_model(body.model_id.strip())
+    logger.info(f"Model switched to: {body.model_id}")
+    return {"message": f"Model switched to {body.model_id}", "current": brain_module._AI_MODEL}
+
+
+# ------------------------------------------------------------------ #
+#  Debug snapshots                                                     #
+# ------------------------------------------------------------------ #
+
+
+@app.get("/api/snapshots")
+async def list_snapshots():
+    """List all saved page snapshots from the last crawl."""
+    snap_dir = DATA_DIR / "debug_snapshots"
+    if not snap_dir.exists():
+        return {"snapshots": []}
+    files = sorted(snap_dir.glob("*.html"))
+    return {
+        "snapshots": [
+            {"name": f.stem, "size_kb": round(f.stat().st_size / 1024, 1)}
+            for f in files
+        ]
+    }
+
+
+@app.get("/api/snapshots/{name}")
+async def get_snapshot(name: str):
+    """Serve a specific HTML snapshot file."""
+    # Sanitize — only allow safe filename characters
+    import re as _re
+    safe = _re.sub(r"[^\w\-]", "", name)
+    snap_path = (DATA_DIR / "debug_snapshots" / f"{safe}.html").resolve()
+    if not str(snap_path).startswith(str(DATA_DIR)):
+        raise HTTPException(403, "Access denied")
+    if not snap_path.exists():
+        raise HTTPException(404, "Snapshot not found")
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=snap_path.read_text(encoding="utf-8", errors="replace"))
 
 
 # ------------------------------------------------------------------ #

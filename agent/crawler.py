@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -182,6 +183,7 @@ class CanvasCrawler:
         # /courses shows an enrollment list without the ic-DashboardCard elements.
         await self._goto(f"{self.base_url}/")
         await self.page.wait_for_timeout(2000)  # cards load via JS after networkidle
+        await self._save_page_snapshot("00_dashboard")
 
         courses = []
         for card in await self.page.query_selector_all(".ic-DashboardCard"):
@@ -444,6 +446,34 @@ class CanvasCrawler:
         return (await el.inner_text()) if el else ""
 
     # ------------------------------------------------------------------ #
+    #  Page snapshot saving                                               #
+    # ------------------------------------------------------------------ #
+
+    async def _save_page_snapshot(self, name: str) -> None:
+        """
+        Save the current page's full HTML to the debug snapshots directory.
+        These snapshots let us inspect exactly what Canvas is rendering so
+        we can verify and fix CSS selectors without guessing.
+
+        Files are saved to DATA_DIR/debug_snapshots/<name>.html
+        and are overwritten on each crawl so they always reflect the latest.
+        """
+        try:
+            data_dir = os.environ.get("DATA_DIR", "data")
+            snap_dir = Path(data_dir) / "debug_snapshots"
+            snap_dir.mkdir(parents=True, exist_ok=True)
+
+            # Sanitize name for use as a filename
+            safe_name = re.sub(r"[^\w\-]", "_", name)[:80]
+            dest = snap_dir / f"{safe_name}.html"
+
+            html = await self.page.content()
+            dest.write_text(html, encoding="utf-8", errors="replace")
+            logger.debug(f"Snapshot saved: {dest}")
+        except Exception as e:
+            logger.warning(f"Could not save snapshot for {name}: {e}")
+
+    # ------------------------------------------------------------------ #
     #  Full crawl                                                          #
     # ------------------------------------------------------------------ #
 
@@ -457,14 +487,23 @@ class CanvasCrawler:
 
         for course in courses:
             cid = course["id"]
-            logger.info(f"[CRAWL] {course['name']}")  # RF-24: no emoji
+            slug = re.sub(r"[^\w]", "_", course["name"])[:30]
+            logger.info(f"[CRAWL] {course['name']}")
 
             course["syllabus"] = await self.get_syllabus(cid)
+            await self._save_page_snapshot(f"{slug}_{cid}_syllabus")
+
             course["announcements"] = await self.get_announcements(cid)
+            await self._save_page_snapshot(f"{slug}_{cid}_announcements")
+
             course["modules"] = await self.get_modules(cid)
+            await self._save_page_snapshot(f"{slug}_{cid}_modules")
+
             course["grades"] = await self.get_grades(cid)
+            await self._save_page_snapshot(f"{slug}_{cid}_grades")
 
             assignments = await self.get_assignments(cid)
+            await self._save_page_snapshot(f"{slug}_{cid}_assignments")
             logger.info(f"  Found {len(assignments)} assignments")
 
             for a in assignments:

@@ -86,6 +86,30 @@ def _get_client():
 # RF-ModelConst: single source of truth for the model string
 _AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-4-20250514")
 
+# Known free models with good context windows — shown in the dashboard switcher
+FREE_MODELS = [
+    {"id": "google/gemini-2.5-pro-exp-03-25:free",          "label": "Gemini 2.5 Pro (free) — 1M ctx, best quality"},
+    {"id": "meta-llama/llama-4-scout:free",                  "label": "Llama 4 Scout (free) — 10M ctx, huge context"},
+    {"id": "meta-llama/llama-4-maverick:free",               "label": "Llama 4 Maverick (free) — 1M ctx"},
+    {"id": "deepseek/deepseek-chat-v3-0324:free",            "label": "DeepSeek V3 (free) — 164K ctx"},
+    {"id": "mistralai/mistral-small-3.1-24b-instruct:free",  "label": "Mistral Small 3.1 (free) — 128K ctx"},
+    {"id": "meta-llama/llama-3.3-70b-instruct:free",         "label": "Llama 3.3 70B (free) — 131K ctx"},
+    {"id": "openrouter/free",                                 "label": "OpenRouter Auto (free) — picks best available"},
+    {"id": "claude-sonnet-4-20250514",                       "label": "Claude Sonnet 4 (paid) — best quality"},
+]
+
+
+def set_model(model_id: str) -> None:
+    """
+    Switch the active AI model at runtime without restarting the server.
+    The new model takes effect on the next API call.
+    """
+    global _AI_MODEL, _client
+    _AI_MODEL = model_id
+    # Reset client so it is rebuilt with the correct provider on next call
+    _client = None
+    logger.info(f"AI model switched to: {model_id}")
+
 MAX_HISTORY_TURNS = 20
 _UPCOMING_CACHE_TTL = 300  # seconds
 
