@@ -26,7 +26,7 @@ from agent.document_ingester import DocumentIngester
 
 logger = logging.getLogger(__name__)
 
-CANVAS_URL = os.environ.get("CANVAS_URL", "https://wilmu.instructure.com")
+CANVAS_URL = os.environ.get("CANVAS_URL", "https://wilmu.instructure.com").rstrip("/")
 
 _MIN_DELAY = 1.5
 _MAX_DELAY = 3.5
@@ -42,7 +42,13 @@ async def _polite_goto(page: Page, url: str) -> None:
     delay = random.uniform(_MIN_DELAY, _MAX_DELAY)
     logger.debug(f"Sleeping {delay:.1f}s before: {url}")
     await asyncio.sleep(delay)
-    await page.goto(url, wait_until="networkidle")
+    try:
+        await page.goto(url, wait_until="networkidle", timeout=45000)
+    except Exception:
+        # networkidle can time out on dynamic Canvas pages — fall back to
+        # domcontentloaded which resolves as soon as the HTML is parsed
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await asyncio.sleep(2.0)  # brief settle time for JS rendering
 
 
 class CanvasCrawler:
