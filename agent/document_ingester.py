@@ -273,7 +273,10 @@ class DocumentIngester:
         """Download every file listed in the Canvas Files section."""
         try:
             await self._goto(f"{self.base_url}/courses/{course_id}/files")
-            await asyncio.sleep(0.5)
+            try:
+                await self.page.wait_for_selector("a.ef-name-col__link, tr.ef-item-row", timeout=8000)
+            except Exception:
+                await self.page.wait_for_timeout(2000)
 
             file_links = await self.page.query_selector_all(
                 "a.ef-name-col__link, a[href*='/files/'], tr.ef-item-row a"
@@ -294,7 +297,10 @@ class DocumentIngester:
         """Read all instructor-created Canvas pages for embedded links and content."""
         try:
             await self._goto(f"{self.base_url}/courses/{course_id}/pages")
-            await asyncio.sleep(0.5)
+            try:
+                await self.page.wait_for_selector("a.wiki-page-link, .pages-index", timeout=8000)
+            except Exception:
+                await self.page.wait_for_timeout(2000)
 
             page_links = await self.page.query_selector_all(
                 "a.wiki-page-link, table.index_content a[href*='/pages/']"
@@ -315,7 +321,10 @@ class DocumentIngester:
         """Walk all module items and process external URLs and file links."""
         try:
             await self._goto(f"{self.base_url}/courses/{course_id}/modules")
-            await asyncio.sleep(0.5)
+            try:
+                await self.page.wait_for_selector(".context_module_item", timeout=8000)
+            except Exception:
+                await self.page.wait_for_timeout(2000)
 
             items = await self.page.query_selector_all(".context_module_item")
 

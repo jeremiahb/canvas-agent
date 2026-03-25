@@ -222,42 +222,85 @@ class CanvasCrawler:
     async def get_assignments(self, course_id: str) -> list:
         """Return all assignments for a course."""
         await self._goto(f"{self.base_url}/courses/{course_id}/assignments")
-        await self.page.wait_for_timeout(500)
+
+        # Canvas assignments page is React-rendered — wait for the assignment
+        # groups to actually appear in the DOM, up to 10 seconds.
+        try:
+            await self.page.wait_for_selector(
+                ".assignment-group, .ig-row, [data-view='assignment']",
+                timeout=10000
+            )
+        except Exception:
+            logger.warning(f"Assignments selector not found for course {course_id} — page may be empty or still loading")
+            await self.page.wait_for_timeout(3000)
 
         assignments = []
-        for group in await self.page.query_selector_all(".assignment-group"):
-            for item in await group.query_selector_all(".assignment"):
+
+        # Try primary Canvas selectors (.assignment-group > .assignment)
+        groups = await self.page.query_selector_all(".assignment-group")
+        if groups:
+            for group in groups:
+                for item in await group.query_selector_all(".assignment"):
+                    try:
+                        link = await item.query_selector("a.ig-title")
+                        if not link:
+                            continue
+                        href = await link.get_attribute("href") or ""
+                        if "/assignments/" not in href:
+                            continue
+                        due_el = await item.query_selector(".assignment-date-due")
+                        points_el = await item.query_selector(".non-screenreader")
+                        assignments.append({
+                            "id": href.split("/assignments/")[1].split("/")[0],
+                            "title": (await link.inner_text()).strip(),
+                            "url": f"{self.base_url}{href}",
+                            "due": (await due_el.inner_text()).strip() if due_el else "No due date",
+                            "points": (await points_el.inner_text()).strip() if points_el else "",
+                            "details": None,
+                        })
+                    except Exception as e:
+                        logger.warning(f"Error parsing assignment item: {e}")
+
+        # Fallback: scan all assignment links directly from the page
+        if not assignments:
+            logger.info(f"Primary selector found nothing for {course_id}, trying link fallback")
+            links = await self.page.query_selector_all("a[href*='/assignments/']")
+            seen = set()
+            for link in links:
                 try:
-                    link = await item.query_selector("a.ig-title")
-                    if not link:
-                        continue
-
                     href = await link.get_attribute("href") or ""
-                    if "/assignments/" not in href:
-                        logger.warning(f"Skipping assignment with unexpected href: {href!r}")
+                    if "/assignments/" not in href or href in seen:
                         continue
-
-                    due_el = await item.query_selector(".assignment-date-due")
-                    points_el = await item.query_selector(".non-screenreader")
-
+                    # Skip syllabus and submission links
+                    if "syllabus" in href or "submissions" in href:
+                        continue
+                    seen.add(href)
+                    title = (await link.inner_text()).strip()
+                    if not title:
+                        continue
+                    aid = href.split("/assignments/")[1].split("/")[0]
+                    if not aid.isdigit():
+                        continue
                     assignments.append({
-                        "id": href.split("/assignments/")[1].split("/")[0],
-                        "title": (await link.inner_text()).strip(),
-                        "url": f"{self.base_url}{href}",
-                        "due": (await due_el.inner_text()).strip() if due_el else "No due date",
-                        "points": (await points_el.inner_text()).strip() if points_el else "",
+                        "id": aid,
+                        "title": title,
+                        "url": f"{self.base_url}{href}" if href.startswith("/") else href,
+                        "due": "No due date",
+                        "points": "",
                         "details": None,
                     })
-
                 except Exception as e:
-                    logger.warning(f"Error parsing assignment item: {e}", exc_info=True)
+                    logger.warning(f"Error in link fallback: {e}")
 
         return assignments
 
     async def get_assignment_details(self, assignment_url: str) -> dict:
         """Return description, submission types, points, and rubric for one assignment."""
         await self._goto(assignment_url)
-        await self.page.wait_for_timeout(500)
+        try:
+            await self.page.wait_for_selector("#assignment_description, .assignment-description", timeout=8000)
+        except Exception:
+            await self.page.wait_for_timeout(2000)
 
         details: dict = {
             "description": "",
@@ -302,7 +345,10 @@ class CanvasCrawler:
     async def get_announcements(self, course_id: str) -> list:
         """Return all announcements for a course."""
         await self._goto(f"{self.base_url}/courses/{course_id}/announcements")
-        await self.page.wait_for_timeout(500)
+        try:
+            await self.page.wait_for_selector(".ic-announcement-row, .discussion-topic", timeout=8000)
+        except Exception:
+            await self.page.wait_for_timeout(2000)
 
         announcements = []
         for item in await self.page.query_selector_all(".ic-announcement-row"):
@@ -327,7 +373,10 @@ class CanvasCrawler:
     async def get_modules(self, course_id: str) -> list:
         """Return all modules and their items for a course."""
         await self._goto(f"{self.base_url}/courses/{course_id}/modules")
-        await self.page.wait_for_timeout(500)
+        try:
+            await self.page.wait_for_selector(".context_module", timeout=8000)
+        except Exception:
+            await self.page.wait_for_timeout(2000)
 
         modules = []
         for mod in await self.page.query_selector_all(".context_module"):
@@ -359,7 +408,10 @@ class CanvasCrawler:
     async def get_grades(self, course_id: str) -> list:
         """Return all graded assignments for a course."""
         await self._goto(f"{self.base_url}/courses/{course_id}/grades")
-        await self.page.wait_for_timeout(500)
+        try:
+            await self.page.wait_for_selector("tr.student_assignment, .gradebook-cell", timeout=8000)
+        except Exception:
+            await self.page.wait_for_timeout(2000)
 
         grades = []
         for row in await self.page.query_selector_all("tr.student_assignment"):
