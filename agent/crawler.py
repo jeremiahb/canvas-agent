@@ -405,6 +405,9 @@ class CanvasCrawler:
             await self.page.wait_for_selector(".context_module", timeout=8000)
         except Exception:
             await self.page.wait_for_timeout(2000)
+        # Extra settle time for Canvas's React to finish populating item hrefs.
+        # Without this, ExternalTool items have {{ id }} placeholder hrefs.
+        await self.page.wait_for_timeout(3000)
 
         modules = []
         for mod in await self.page.query_selector_all(".context_module"):
@@ -417,9 +420,14 @@ class CanvasCrawler:
                     link = await item.query_selector("a.title")
                     if link:
                         item_href = await link.get_attribute("href") or ""
+                        # Skip Handlebars template placeholders that React hasn't
+                        # rendered yet — these look like /external_tools/1?...={{ id }}
+                        if "{{" in item_href or "}}" in item_href:
+                            logger.debug(f"Skipping unrendered module item href: {item_href!r}")
+                            continue
                         items.append({
                             "title": (await link.inner_text()).strip(),
-                            "url": f"{self.base_url}{item_href}" if item_href else "",
+                            "url": f"{self.base_url}{item_href}" if item_href.startswith("/") else item_href,
                         })
 
                 modules.append({"name": name, "items": items})

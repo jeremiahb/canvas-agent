@@ -274,19 +274,23 @@ class DocumentIngester:
         try:
             await self._goto(f"{self.base_url}/courses/{course_id}/files")
             try:
-                await self.page.wait_for_selector("a.ef-name-col__link, tr.ef-item-row", timeout=8000)
+                await self.page.wait_for_selector(
+                    "a.ef-name-col__link, tr.ef-item-row, .ef-directory", timeout=10000
+                )
             except Exception:
-                await self.page.wait_for_timeout(2000)
+                await self.page.wait_for_timeout(3000)
 
             file_links = await self.page.query_selector_all(
-                "a.ef-name-col__link, a[href*='/files/'], tr.ef-item-row a"
+                "a.ef-name-col__link, tr.ef-item-row a[href*='/files/'], a[href*='/download']"
             )
 
+            seen_hrefs: set[str] = set()
             for link in file_links:
                 href = await link.get_attribute("href") or ""
                 name = (await link.inner_text()).strip()
-                if not href:
+                if not href or href in seen_hrefs:
                     continue
+                seen_hrefs.add(href)
                 full_url = href if href.startswith("http") else f"{self.base_url}{href}"
                 await self._process_url(full_url, name, course_name, source="files")
 
@@ -298,20 +302,29 @@ class DocumentIngester:
         try:
             await self._goto(f"{self.base_url}/courses/{course_id}/pages")
             try:
-                await self.page.wait_for_selector("a.wiki-page-link, .pages-index", timeout=8000)
+                await self.page.wait_for_selector(
+                    "a.wiki-page-link, .pages-index, table.index_content", timeout=8000
+                )
             except Exception:
                 await self.page.wait_for_timeout(2000)
 
             page_links = await self.page.query_selector_all(
-                "a.wiki-page-link, table.index_content a[href*='/pages/']"
+                "a.wiki-page-link, "
+                "table.index_content a[href*='/pages/'], "
+                "a[href*='/courses/'][href*='/pages/']"
             )
 
+            seen_hrefs: set[str] = set()
             for link in page_links:
                 href = await link.get_attribute("href") or ""
-                if not href:
+                if not href or href in seen_hrefs:
                     continue
+                # Skip template/placeholder hrefs
+                if "{{" in href or "}}" in href:
+                    continue
+                seen_hrefs.add(href)
                 full_url = href if href.startswith("http") else f"{self.base_url}{href}"
-                # RF-Dedup: checked inside _process_url / _scrape_canvas_page
+                # RF-Dedup: checked inside _scrape_canvas_page
                 await self._scrape_canvas_page(full_url, course_name)
 
         except Exception as e:
@@ -325,6 +338,9 @@ class DocumentIngester:
                 await self.page.wait_for_selector(".context_module_item", timeout=8000)
             except Exception:
                 await self.page.wait_for_timeout(2000)
+            # Extra settle time for React to finish populating item hrefs.
+            # Without this, ExternalTool items have {{ id }} Handlebars placeholders.
+            await self.page.wait_for_timeout(3000)
 
             items = await self.page.query_selector_all(".context_module_item")
 
@@ -339,6 +355,11 @@ class DocumentIngester:
                 title = (await link.inner_text()).strip()
 
                 if not href:
+                    continue
+
+                # Skip unrendered Handlebars template hrefs — React hasn't populated them yet
+                if "{{" in href or "}}" in href:
+                    logger.debug(f"Skipping unrendered module item href: {href!r}")
                     continue
 
                 full_url = href if href.startswith("http") else f"{self.base_url}{href}"
