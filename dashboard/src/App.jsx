@@ -510,6 +510,8 @@ async function downloadDraft(draftId, api) {
 // ------------------------------------------------------------------ //
 function KnowledgePanel({ api }) {
   const [tab, setTab] = useState("search");
+  const [courses, setCourses] = useState([]);
+  const [selectedCourse, setSelectedCourse] = useState("");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState(null);
   const [searching, setSearching] = useState(false);
@@ -519,6 +521,7 @@ function KnowledgePanel({ api }) {
 
   useEffect(() => {
     api.get("/knowledge/stats").then(setStats).catch(() => {});
+    api.get("/knowledge/courses").then((r) => setCourses(r.courses || [])).catch(() => {});
   }, [api]);
 
   const search = async () => {
@@ -526,9 +529,10 @@ function KnowledgePanel({ api }) {
     setSearching(true);
     setResults(null);
     try {
+      const body = { message: query, course_name: selectedCourse || undefined };
       const [searchRes, docRes] = await Promise.all([
-        api.post("/knowledge/search", { message: query }),
-        api.post("/documents/search", { message: query }),
+        api.post("/knowledge/search", body),
+        api.post("/documents/search", body),
       ]);
       setResults({
         assignments: searchRes.assignments || [],
@@ -544,20 +548,22 @@ function KnowledgePanel({ api }) {
   const generateSummary = async () => {
     setSummarizing(true);
     setSummary("");
+    const courseClause = selectedCourse ? `for ${selectedCourse}` : "for all my courses";
     try {
       const res = await api.post("/chat", {
-        message: "Give me a comprehensive summary of everything you know about my courses. Include: what courses I am in, key themes from each course, major assignments, and important concepts from the readings and materials you have read. Be specific and detailed.",
+        message: `Give me a comprehensive knowledge summary ${courseClause}. Include: key themes and concepts, what the syllabus covers, major assignments, important readings and what they cover, and anything else you know from the course materials. Be specific and detailed.`,
       });
       setSummary(res.reply || "");
     } catch {
-      setSummary("Error generating summary — make sure the AI model is configured and credits are added.");
+      setSummary("Error generating summary — make sure the AI model is configured.");
     }
     setSummarizing(false);
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
 
+      {/* Stats */}
       {stats && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
           {[["Assignments", stats.assignments], ["Documents", stats.documents],
@@ -570,6 +576,18 @@ function KnowledgePanel({ api }) {
         </div>
       )}
 
+      {/* Course selector */}
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <div style={{ fontSize: 12, color: "#6b7280", flexShrink: 0 }}>Course:</div>
+        <select value={selectedCourse} onChange={(e) => { setSelectedCourse(e.target.value); setResults(null); setSummary(""); }}
+          style={{ flex: 1, padding: "8px 12px", background: "#1f2937", border: "1px solid #374151",
+            borderRadius: 8, color: "#f9fafb", fontSize: 13, fontFamily: "inherit" }}>
+          <option value="">All Courses</option>
+          {courses.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+      </div>
+
+      {/* Tabs */}
       <div style={{ display: "flex", gap: 4 }}>
         {["search", "summary"].map((t) => (
           <button key={t} onClick={() => setTab(t)} style={{
@@ -577,7 +595,7 @@ function KnowledgePanel({ api }) {
             background: tab === t ? "#1d4ed8" : "#1f2937", color: "#f9fafb",
             fontSize: 13, fontFamily: "inherit", fontWeight: tab === t ? 600 : 400,
           }}>
-            {t === "search" ? "Search Knowledge" : "AI Course Summary"}
+            {t === "search" ? "Search Knowledge" : "AI Summary"}
           </button>
         ))}
       </div>
@@ -587,24 +605,23 @@ function KnowledgePanel({ api }) {
           <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
             <input value={query} onChange={(e) => setQuery(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && search()}
-              placeholder="Search across assignments, documents, readings, syllabi, modules…"
+              placeholder={`Search${selectedCourse ? ` in ${selectedCourse}` : " all courses"}…`}
               style={{ ...inputStyle, flex: 1 }} />
             <Btn onClick={search} disabled={searching || !query.trim()}>
               {searching ? "Searching…" : "Search"}
             </Btn>
           </div>
-
           {!results && (
             <div style={{ fontSize: 13, color: "#4b5563", textAlign: "center", padding: 32 }}>
-              Search across everything the agent has read — syllabi, readings, documents, and assignments.
+              Search across syllabi, readings, documents, and assignments
+              {selectedCourse ? ` for ${selectedCourse}` : ""}.
             </div>
           )}
-
           {results && (
             <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
               {[
-                { key: "documents", label: "Documents & Readings" },
-                { key: "content",   label: "Course Content" },
+                { key: "documents",   label: "Documents & Readings" },
+                { key: "content",     label: "Course Content" },
                 { key: "assignments", label: "Assignments" },
               ].map(({ key, label }) =>
                 results[key]?.length > 0 ? (
@@ -617,7 +634,7 @@ function KnowledgePanel({ api }) {
                   </div>
                 ) : null
               )}
-              {results.documents?.length === 0 && results.content?.length === 0 && results.assignments?.length === 0 && (
+              {!results.documents?.length && !results.content?.length && !results.assignments?.length && (
                 <EmptyState label="No results found. Try different keywords." />
               )}
             </div>
@@ -628,10 +645,11 @@ function KnowledgePanel({ api }) {
       {tab === "summary" && (
         <div>
           <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 14 }}>
-            Ask the agent to summarize what it knows — courses, key concepts, assignments, and material it has read.
+            Generate an AI summary of everything indexed
+            {selectedCourse ? ` for ${selectedCourse}` : " across all courses"}.
           </p>
           <Btn onClick={generateSummary} disabled={summarizing} style={{ marginBottom: 16 }}>
-            {summarizing ? "Generating…" : "Generate Course Knowledge Summary"}
+            {summarizing ? "Generating…" : `Summarize ${selectedCourse || "All Courses"}`}
           </Btn>
           {summary && (
             <div style={{ padding: 20, background: "#1f2937", borderRadius: 12,
@@ -687,11 +705,230 @@ function KnowledgeCard({ result }) {
 
 
 // ------------------------------------------------------------------ //
-// Documents panel — flagged external links + manual upload
+// Documents panel — indexed docs, flagged links, manual upload
 // ------------------------------------------------------------------ //
 function DocumentsPanel({ api }) {
+  const [courses, setCourses] = useState([]);
+  const [selectedCourse, setSelectedCourse] = useState("");
+  const [docTab, setDocTab] = useState("indexed");
+  const [indexedDocs, setIndexedDocs] = useState([]);
+  const [loadingDocs, setLoadingDocs] = useState(false);
   const [flagged, setFlagged] = useState([]);
-  const [docTab, setDocTab] = useState("flagged");
+  const [pasteTitle, setPasteTitle] = useState("");
+  const [pasteText, setPasteText] = useState("");
+  const [pasteCourse, setPasteCourse] = useState("");
+  const [uploadFile, setUploadFile] = useState(null);
+  const [uploadTitle, setUploadTitle] = useState("");
+  const [uploadCourse, setUploadCourse] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  useEffect(() => {
+    api.get("/knowledge/courses").then((r) => setCourses(r.courses || [])).catch(() => {});
+    api.get("/documents/flagged").then((r) => setFlagged(r.flagged || [])).catch(() => {});
+    loadIndexed("");
+  }, [api]);
+
+  const loadIndexed = async (course) => {
+    setLoadingDocs(true);
+    try {
+      const url = course ? `/documents/list?course_name=${encodeURIComponent(course)}` : "/documents/list";
+      const res = await api.get(url);
+      setIndexedDocs(res.documents || []);
+    } catch { setIndexedDocs([]); }
+    setLoadingDocs(false);
+  };
+
+  const onCourseChange = (course) => {
+    setSelectedCourse(course);
+    if (docTab === "indexed") loadIndexed(course);
+    if (docTab === "flagged") {
+      const filt = course
+        ? api.get(`/documents/flagged/${encodeURIComponent(course)}`).then((r) => setFlagged(r.flagged || [])).catch(() => {})
+        : api.get("/documents/flagged").then((r) => setFlagged(r.flagged || [])).catch(() => {});
+    }
+  };
+
+  const savePaste = async () => {
+    if (!pasteTitle.trim() || !pasteText.trim() || !pasteCourse.trim()) {
+      setMsg("Title, course, and text are all required."); return;
+    }
+    setSaving(true); setMsg("");
+    try {
+      const res = await api.post("/documents/upload", { title: pasteTitle, text: pasteText, course_name: pasteCourse });
+      setMsg(res.message || "Added.");
+      setPasteTitle(""); setPasteText(""); setPasteCourse("");
+      loadIndexed(selectedCourse);
+    } catch (e) { setMsg("Failed: " + e.message); }
+    setSaving(false);
+  };
+
+  const saveFile = async () => {
+    if (!uploadFile || !uploadCourse.trim()) { setMsg("Select a file and enter the course name."); return; }
+    setSaving(true); setMsg("");
+    try {
+      const res = await api.uploadWithFields("/documents/upload-file", uploadFile, {
+        course_name: uploadCourse, title: uploadTitle || undefined,
+      });
+      setMsg(res.message || "Uploaded.");
+      setUploadFile(null); setUploadTitle(""); setUploadCourse("");
+      loadIndexed(selectedCourse);
+    } catch (e) { setMsg("Failed: " + e.message); }
+    setSaving(false);
+  };
+
+  // Group indexed docs by doc_type for display
+  const docGroups = indexedDocs.reduce((acc, d) => {
+    const type = d.metadata?.doc_type || d.metadata?.source || "other";
+    if (!acc[type]) acc[type] = [];
+    acc[type].push(d);
+    return acc;
+  }, {});
+
+  const typeLabel = (t) => ({
+    canvas_file: "Canvas Files", html_page: "Canvas Pages", google_doc: "Google Docs",
+    microsoft_doc: "OneDrive / SharePoint", google_drive: "Google Drive",
+    manual_upload: "Manually Uploaded", web_page: "Web Pages",
+  }[t] || t);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+      {/* Course selector */}
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <div style={{ fontSize: 12, color: "#6b7280", flexShrink: 0 }}>Course:</div>
+        <select value={selectedCourse} onChange={(e) => onCourseChange(e.target.value)}
+          style={{ flex: 1, padding: "8px 12px", background: "#1f2937", border: "1px solid #374151",
+            borderRadius: 8, color: "#f9fafb", fontSize: 13, fontFamily: "inherit" }}>
+          <option value="">All Courses</option>
+          {courses.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+        {["indexed", "flagged", "paste", "file"].map((t) => (
+          <button key={t} onClick={() => { setDocTab(t); setMsg(""); if (t === "indexed") loadIndexed(selectedCourse); }} style={{
+            padding: "6px 16px", borderRadius: 20, border: "none", cursor: "pointer",
+            background: docTab === t ? "#1d4ed8" : "#1f2937", color: "#f9fafb",
+            fontSize: 13, fontFamily: "inherit", fontWeight: docTab === t ? 600 : 400,
+          }}>
+            {t === "indexed" ? `Course Documents (${indexedDocs.length})` :
+             t === "flagged" ? `Flagged (${flagged.length})` :
+             t === "paste" ? "Paste Text" : "Upload File"}
+          </button>
+        ))}
+      </div>
+
+      {docTab === "indexed" && (
+        <div>
+          <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 12 }}>
+            All documents the agent has read and indexed from Canvas
+            {selectedCourse ? ` for ${selectedCourse}` : ""}.
+          </p>
+          {loadingDocs && <div style={{ fontSize: 13, color: "#6b7280" }}>Loading…</div>}
+          {!loadingDocs && indexedDocs.length === 0 && (
+            <EmptyState label="No documents indexed yet. Run a crawl first." />
+          )}
+          {Object.entries(docGroups).map(([type, docs]) => (
+            <div key={type} style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280",
+                textTransform: "uppercase", letterSpacing: ".07em", marginBottom: 8 }}>
+                {typeLabel(type)} ({docs.length})
+              </div>
+              {docs.map((d, i) => (
+                <div key={i} style={{ padding: "10px 14px", background: "#1f2937", borderRadius: 8, marginBottom: 6 }}>
+                  <div style={{ fontSize: 13, fontWeight: 500, color: "#f9fafb" }}>
+                    {d.metadata?.title || "Untitled"}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#6b7280", marginTop: 2 }}>
+                    {d.metadata?.course_name}
+                    {d.metadata?.total_chunks > 1 ? ` · ${d.metadata.total_chunks} chunks` : ""}
+                    {d.metadata?.char_count ? ` · ${Math.round(d.metadata.char_count / 1000)}K chars` : ""}
+                  </div>
+                  {d.metadata?.url && (
+                    <a href={d.metadata.url} target="_blank" rel="noopener noreferrer"
+                      style={{ fontSize: 11, color: "#3b82f6", marginTop: 3, display: "block" }}>
+                      {d.metadata.url.slice(0, 80)}{d.metadata.url.length > 80 ? "…" : ""}
+                    </a>
+                  )}
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {docTab === "flagged" && (
+        <div>
+          <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 12 }}>
+            Links found on Canvas that couldn't be accessed automatically. Add them manually below.
+          </p>
+          {flagged.length === 0 && <EmptyState label="No flagged external links found." />}
+          {flagged.map((f, i) => (
+            <div key={i} style={{ padding: 14, background: "#1f2937", borderRadius: 10, marginBottom: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: "#f9fafb" }}>{f.metadata?.title || f.document}</div>
+              <div style={{ fontSize: 12, color: "#f59e0b", marginTop: 4 }}>{f.metadata?.platform}</div>
+              <div style={{ fontSize: 11, color: "#6b7280", marginTop: 2 }}>{f.metadata?.course_name}</div>
+              {f.metadata?.url && (
+                <a href={f.metadata.url} target="_blank" rel="noopener noreferrer"
+                  style={{ fontSize: 11, color: "#3b82f6", marginTop: 4, display: "block", wordBreak: "break-all" }}>
+                  {f.metadata.url}
+                </a>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {docTab === "paste" && (
+        <Section title="Paste Reading Text">
+          <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 14 }}>
+            Copy text from VitalSource, Pearson, or any external platform and paste it here.
+          </p>
+          <input value={pasteTitle} onChange={(e) => setPasteTitle(e.target.value)}
+            placeholder="Document title" style={inputStyle} />
+          <select value={pasteCourse} onChange={(e) => setPasteCourse(e.target.value)}
+            style={{ ...inputStyle, marginTop: 8 }}>
+            <option value="">Select course…</option>
+            {courses.map((c) => <option key={c} value={c}>{c}</option>)}
+            <option value="__custom">Other (type below)</option>
+          </select>
+          {pasteCourse === "__custom" && (
+            <input onChange={(e) => setPasteCourse(e.target.value)}
+              placeholder="Course name" style={{ ...inputStyle, marginTop: 8 }} />
+          )}
+          <textarea value={pasteText} onChange={(e) => setPasteText(e.target.value)}
+            placeholder="Paste the reading content here…" rows={10}
+            style={{ ...inputStyle, marginTop: 8, resize: "vertical" }} />
+          {msg && <div style={{ fontSize: 12, color: msg.startsWith("Failed") ? "#ef4444" : "#22c55e", marginTop: 8 }}>{msg}</div>}
+          <Btn onClick={savePaste} disabled={saving} style={{ marginTop: 10 }}>
+            {saving ? "Saving…" : "Add to Knowledge Base"}
+          </Btn>
+        </Section>
+      )}
+
+      {docTab === "file" && (
+        <Section title="Upload PDF or Word File">
+          <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 14 }}>Upload a PDF or .docx file. Max 20 MB.</p>
+          <input type="file" accept=".pdf,.docx,.txt" onChange={(e) => setUploadFile(e.target.files[0])}
+            style={{ fontSize: 13, color: "#d1d5db", marginBottom: 8, display: "block" }} />
+          <input value={uploadTitle} onChange={(e) => setUploadTitle(e.target.value)}
+            placeholder="Document title (optional)" style={inputStyle} />
+          <select value={uploadCourse} onChange={(e) => setUploadCourse(e.target.value)}
+            style={{ ...inputStyle, marginTop: 8 }}>
+            <option value="">Select course…</option>
+            {courses.map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+          {msg && <div style={{ fontSize: 12, color: msg.startsWith("Failed") ? "#ef4444" : "#22c55e", marginTop: 8 }}>{msg}</div>}
+          <Btn onClick={saveFile} disabled={saving || !uploadFile} style={{ marginTop: 10 }}>
+            {saving ? "Uploading…" : "Upload and Index"}
+          </Btn>
+        </Section>
+      )}
+    </div>
+  );
+}
   const [pasteTitle, setPasteTitle] = useState("");
   const [pasteText, setPasteText] = useState("");
   const [pasteCourse, setPasteCourse] = useState("");

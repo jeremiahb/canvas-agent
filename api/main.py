@@ -236,6 +236,7 @@ if crawl_status.get("running"):
 class ChatMessage(BaseModel):
     message: str
     conversation_id: Optional[str] = None
+    course_name: Optional[str] = None
 
 
 class VoiceSample(BaseModel):
@@ -425,6 +426,12 @@ async def knowledge_stats():
     return kb.stats()
 
 
+@app.get("/api/knowledge/courses")
+async def get_course_names():
+    """Return all unique course names across the knowledge base."""
+    return {"courses": kb.get_course_names()}
+
+
 @app.get("/api/knowledge/assignments")
 async def get_assignments():
     return kb.get_all_assignments()
@@ -437,7 +444,6 @@ async def get_upcoming():
 
 @app.get("/api/knowledge/briefing")
 async def get_briefing():
-    # RF-EventLoop: get_running_loop() not get_event_loop()
     briefing = await asyncio.get_running_loop().run_in_executor(
         None, brain.generate_daily_briefing
     )
@@ -446,8 +452,9 @@ async def get_briefing():
 
 @app.post("/api/knowledge/search")
 async def search_knowledge(body: ChatMessage):
+    course = getattr(body, "course_name", None)
     assignments = kb.search_assignments(body.message)
-    content = kb.search_course_content(body.message)
+    content = kb.search_course_content_by_course(body.message, course_name=course)
     return {"assignments": assignments, "content": content}
 
 
@@ -685,10 +692,18 @@ async def upload_document_file(
     }
 
 
+@app.get("/api/documents/list")
+async def list_documents(course_name: Optional[str] = None):
+    """List all indexed documents, optionally filtered by course."""
+    docs = kb.get_documents_by_course(course_name=course_name)
+    return {"documents": docs, "total": len(docs)}
+
+
 @app.post("/api/documents/search")
 async def search_documents(body: ChatMessage):
     """Search the full document / readings knowledge base."""
-    results = kb.search_documents(body.message, n=5)
+    course = getattr(body, "course_name", None)
+    results = kb.search_documents_by_course(body.message, course_name=course, n=8)
     return {"results": results}
 
 

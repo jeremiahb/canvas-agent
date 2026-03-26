@@ -370,7 +370,102 @@ class KnowledgeBase:
         logger.info(f"Stored manual document '{title}' in {len(chunks)} chunks")
         return base_id
 
-    def search_assignments(self, query: str, n: int = 5) -> list:
+    def get_documents_by_course(self, course_name: Optional[str] = None) -> list:
+        """
+        Return all indexed documents, optionally filtered by course name.
+        Returns deduplicated list (only chunk 0 per document) for display.
+        """
+        count = self.documents.count()
+        if count == 0:
+            return []
+        try:
+            if course_name:
+                results = self.documents.get(
+                    where={"course_name": course_name},
+                    include=["documents", "metadatas"],
+                )
+            else:
+                results = self.documents.get(include=["documents", "metadatas"])
+        except Exception as e:
+            logger.error(f"Error fetching documents: {e}")
+            return []
+
+        docs = []
+        seen_titles = set()
+        for i, doc in enumerate(results.get("documents", [])):
+            meta = results["metadatas"][i] if results.get("metadatas") else {}
+            # Only show first chunk per document to avoid duplicates
+            if meta.get("chunk", 0) != 0:
+                continue
+            key = (meta.get("title", ""), meta.get("course_name", ""))
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            docs.append({"document": doc, "metadata": meta})
+        return docs
+
+    def get_course_names(self) -> list[str]:
+        """Return sorted list of all unique course names across all collections."""
+        names = set()
+        for collection in [self.documents, self.assignments, self.course_content]:
+            try:
+                count = collection.count()
+                if count == 0:
+                    continue
+                results = collection.get(include=["metadatas"])
+                for meta in results.get("metadatas", []):
+                    name = meta.get("course_name", "")
+                    if name:
+                        names.add(name)
+            except Exception:
+                pass
+        return sorted(names)
+
+    def search_documents_by_course(self, query: str, course_name: Optional[str] = None, n: int = 5) -> list:
+        """Search documents, optionally scoped to one course."""
+        count = self.documents.count()
+        if count == 0:
+            return []
+        try:
+            if course_name:
+                results = self.documents.query(
+                    query_texts=[query],
+                    n_results=min(n, count),
+                    where={"course_name": course_name},
+                )
+            else:
+                results = self.documents.query(
+                    query_texts=[query],
+                    n_results=min(n, count),
+                )
+            return self._format_results(results)
+        except Exception as e:
+            logger.error(f"Error searching documents: {e}")
+            return []
+
+    def search_course_content_by_course(self, query: str, course_name: Optional[str] = None, n: int = 5) -> list:
+        """Search course content (syllabi, modules, grades), optionally scoped to one course."""
+        count = self.course_content.count()
+        if count == 0:
+            return []
+        try:
+            if course_name:
+                results = self.course_content.query(
+                    query_texts=[query],
+                    n_results=min(n, count),
+                    where={"course_name": course_name},
+                )
+            else:
+                results = self.course_content.query(
+                    query_texts=[query],
+                    n_results=min(n, count),
+                )
+            return self._format_results(results)
+        except Exception as e:
+            logger.error(f"Error searching course content: {e}")
+            return []
+
+
         """Semantic search over assignment documents."""
         count = self.assignments.count()
         if count == 0:
