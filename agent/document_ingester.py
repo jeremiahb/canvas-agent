@@ -57,6 +57,7 @@ EXTERNAL_PLATFORMS = {
 
 GOOGLE_DOCS_HOSTS = {"docs.google.com", "drive.google.com"}
 MICROSOFT_HOSTS   = {"onedrive.live.com", "sharepoint.com", "1drv.ms"}
+YOUTUBE_HOSTS     = {"youtube.com", "youtu.be", "www.youtube.com"}
 
 # Hard cap on individual file downloads to protect against OOM
 MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
@@ -73,7 +74,7 @@ _SKIP_MODULE_DOMAINS = {
 def classify_url(url: str) -> str:
     """
     Return one of: 'canvas_file' | 'google_doc' | 'microsoft_doc' |
-                   'external_platform' | 'web_page' | 'unknown'
+                   'youtube' | 'external_platform' | 'web_page' | 'unknown'
     """
     if not url:
         return "unknown"
@@ -89,6 +90,9 @@ def classify_url(url: str) -> str:
 
     if any(h in host for h in MICROSOFT_HOSTS):
         return "microsoft_doc"
+
+    if any(h in host for h in YOUTUBE_HOSTS):
+        return "youtube"
 
     if "/files/" in parsed.path or "/download" in parsed.path:
         return "canvas_file"
@@ -402,6 +406,9 @@ class DocumentIngester:
         elif url_type in ("google_doc", "microsoft_doc"):
             await self._fetch_embedded_doc(url, title, course_name, source)
 
+        elif url_type == "youtube":
+            await self._fetch_youtube_transcript(url, title, course_name, source)
+
         elif url_type == "web_page":
             await self._fetch_web_page(url, title, course_name, source)
 
@@ -440,7 +447,11 @@ class DocumentIngester:
                                 text = text.strip() + f"\n\n[VISUAL CONTENT]\n{vision_text}"
                         except Exception as e:
                             logger.warning(f"Vision screenshot failed for {url}: {e}")
-                    self._store_result(title, text.strip(), url, course_name, "page", "html_page")
+                    from agent.brain import enrich_for_knowledge_base
+                    enriched = await enrich_for_knowledge_base(
+                        text.strip(), title, course_name, "canvas_page", url
+                    )
+                    self._store_result(title, enriched, url, course_name, "page", "html_page")
 
             links = await self.page.query_selector_all(
                 ".show-content a[href], #wiki_page_show a[href]"
@@ -506,7 +517,11 @@ class DocumentIngester:
             text = extract_text_from_bytes(data, content_type, filename)
 
             if text:
-                self._store_result(title, text, url, course_name, source, "canvas_file")
+                from agent.brain import enrich_for_knowledge_base
+                enriched = await enrich_for_knowledge_base(
+                    text, title, course_name, "canvas_file", url
+                )
+                self._store_result(title, enriched, url, course_name, source, "canvas_file")
                 logger.info(f"Extracted {len(text):,} chars from: {title}")
             else:
                 logger.warning(f"No text extracted from: {title} ({content_type})")
@@ -528,7 +543,11 @@ class DocumentIngester:
                     )
                     text = await self._http_get_text(export_url)
                     if text:
-                        self._store_result(title, text, url, course_name, source, "google_doc")
+                        from agent.brain import enrich_for_knowledge_base
+                        enriched = await enrich_for_knowledge_base(
+                            text, title, course_name, "google_doc", url
+                        )
+                        self._store_result(title, enriched, url, course_name, source, "google_doc")
                         return
 
             if "drive.google.com" in url:
@@ -542,8 +561,12 @@ class DocumentIngester:
                     if data:
                         text = extract_text_from_bytes(data, ct)
                         if text:
+                            from agent.brain import enrich_for_knowledge_base
+                            enriched = await enrich_for_knowledge_base(
+                                text, title, course_name, "google_drive", url
+                            )
                             self._store_result(
-                                title, text, url, course_name, source, "google_drive"
+                                title, enriched, url, course_name, source, "google_drive"
                             )
                             return
 
@@ -554,8 +577,12 @@ class DocumentIngester:
                 if body_el:
                     text = await body_el.inner_text()
                     if len(text.strip()) > 100:
+                        from agent.brain import enrich_for_knowledge_base
+                        enriched = await enrich_for_knowledge_base(
+                            text.strip(), title, course_name, "microsoft_doc", url
+                        )
                         self._store_result(
-                            title, text.strip(), url, course_name, source, "microsoft_doc"
+                            title, enriched, url, course_name, source, "microsoft_doc"
                         )
                         return
 
@@ -579,9 +606,76 @@ class DocumentIngester:
         try:
             text = await self._http_get_text(url)
             if text and len(text) > 200:
-                self._store_result(title, text[:50000], url, course_name, source, "web_page")
+                from agent.brain import enrich_for_knowledge_base
+                enriched = await enrich_for_knowledge_base(
+                    text[:50000], title, course_name, "web_page", url
+                )
+                self._store_result(title, enriched, url, course_name, source, "web_page")
         except Exception as e:
             logger.debug(f"Could not fetch web page {url}: {e}")
+
+    async def _fetch_youtube_transcript(
+        self, url: str, title: str, course_name: str, source: str
+    ) -> None:
+        """
+        Fetch the auto-generated or manual transcript for a YouTube video and
+        store it in the knowledge base so the AI can reference spoken content.
+
+        Uses youtube-transcript-api which fetches transcripts without a browser.
+        Falls back to flagging the video if no transcript is available.
+        """
+        try:
+            from urllib.parse import parse_qs
+            from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+
+            # Extract video ID from both youtube.com/watch?v=ID and youtu.be/ID forms
+            parsed = urlparse(url)
+            if "youtu.be" in parsed.netloc:
+                video_id = parsed.path.lstrip("/").split("?")[0]
+            else:
+                qs = parse_qs(parsed.query)
+                video_id = (qs.get("v") or [""])[0]
+
+            if not video_id:
+                logger.warning(f"Could not extract video ID from YouTube URL: {url}")
+                return
+
+            logger.info(f"Fetching YouTube transcript: {title} ({video_id})")
+
+            loop = asyncio.get_running_loop()
+            transcript_list = await loop.run_in_executor(
+                None, lambda: YouTubeTranscriptApi.get_transcript(video_id)
+            )
+
+            # Join all transcript segments into readable text
+            transcript_text = " ".join(
+                segment.get("text", "") for segment in transcript_list
+            ).strip()
+
+            if not transcript_text:
+                logger.warning(f"Empty transcript for YouTube video: {title}")
+                return
+
+            full_text = f"YouTube Video: {title}\nURL: {url}\n\nTranscript:\n{transcript_text}"
+
+            from agent.brain import enrich_for_knowledge_base
+            enriched = await enrich_for_knowledge_base(
+                full_text, title, course_name, "youtube_video", url
+            )
+            self._store_result(title, enriched, url, course_name, source, "youtube_video")
+            logger.info(f"YouTube transcript stored: {title} ({len(transcript_text):,} chars)")
+
+        except Exception as e:
+            logger.info(f"YouTube transcript unavailable for {url}: {e}")
+            # Store a reference entry so the AI knows the video exists
+            self._store_result(
+                title,
+                f"YouTube Video: {title}\nURL: {url}\nNote: Transcript not available — watch manually.",
+                url,
+                course_name,
+                source,
+                "youtube_video",
+            )
 
     # ------------------------------------------------------------------ #
     #  HTTP helpers                                                        #

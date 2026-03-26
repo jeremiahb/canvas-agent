@@ -523,8 +523,15 @@ class CanvasCrawler:
 
             logger.info(f"[CRAWL] {course['name']}")
 
-            course["syllabus"] = await self.get_syllabus(cid)
+            raw_syllabus = await self.get_syllabus(cid)
             await self._save_page_snapshot(f"{slug}_{cid}_syllabus")
+            if raw_syllabus:
+                from agent.brain import enrich_for_knowledge_base
+                course["syllabus"] = await enrich_for_knowledge_base(
+                    raw_syllabus, "Syllabus", course["name"], "syllabus"
+                )
+            else:
+                course["syllabus"] = raw_syllabus
 
             course["announcements"] = await self.get_announcements(cid)
             await self._save_page_snapshot(f"{slug}_{cid}_announcements")
