@@ -86,16 +86,19 @@ def _get_client():
 # RF-ModelConst: single source of truth for the model string
 _AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-4-20250514")
 
-# Known free models with good context windows — shown in the dashboard switcher
+# Known models shown in the dashboard switcher.
+# Note: ALL OpenRouter models (even free ones) require a credit-enabled account.
+# Add $5 at openrouter.ai/settings/credits — free models cost $0 but credits
+# must be present for the account to be activated.
 FREE_MODELS = [
-    {"id": "google/gemini-2.5-pro-exp-03-25:free",          "label": "Gemini 2.5 Pro (free) — 1M ctx, best quality"},
-    {"id": "meta-llama/llama-4-scout:free",                  "label": "Llama 4 Scout (free) — 10M ctx, huge context"},
-    {"id": "meta-llama/llama-4-maverick:free",               "label": "Llama 4 Maverick (free) — 1M ctx"},
-    {"id": "deepseek/deepseek-chat-v3-0324:free",            "label": "DeepSeek V3 (free) — 164K ctx"},
-    {"id": "mistralai/mistral-small-3.1-24b-instruct:free",  "label": "Mistral Small 3.1 (free) — 128K ctx"},
-    {"id": "meta-llama/llama-3.3-70b-instruct:free",         "label": "Llama 3.3 70B (free) — 131K ctx"},
-    {"id": "openrouter/free",                                 "label": "OpenRouter Auto (free) — picks best available"},
-    {"id": "claude-sonnet-4-20250514",                       "label": "Claude Sonnet 4 (paid) — best quality"},
+    {"id": "openrouter/auto",                                 "label": "OpenRouter Auto · picks best available free model"},
+    {"id": "google/gemini-2.5-pro-exp-03-25:free",           "label": "Gemini 2.5 Pro (free) · 1M ctx · best quality"},
+    {"id": "meta-llama/llama-4-maverick:free",               "label": "Llama 4 Maverick (free) · 1M ctx · strong all-rounder"},
+    {"id": "meta-llama/llama-4-scout:free",                  "label": "Llama 4 Scout (free) · 10M ctx · massive context"},
+    {"id": "deepseek/deepseek-r1:free",                      "label": "DeepSeek R1 (free) · 164K ctx · strong reasoning"},
+    {"id": "mistralai/mistral-small-3.1-24b-instruct:free",  "label": "Mistral Small 3.1 (free) · 128K ctx"},
+    {"id": "meta-llama/llama-3.3-70b-instruct:free",         "label": "Llama 3.3 70B (free) · 131K ctx · reliable"},
+    {"id": "anthropic/claude-sonnet-4-5",                    "label": "Claude Sonnet 4.5 (paid) · best quality"},
 ]
 
 

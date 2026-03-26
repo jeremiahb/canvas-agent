@@ -509,71 +509,182 @@ async function downloadDraft(draftId, api) {
 // Knowledge panel
 // ------------------------------------------------------------------ //
 function KnowledgePanel({ api }) {
-  const [assignments, setAssignments] = useState([]);
-  const [filter, setFilter] = useState("");
+  const [tab, setTab] = useState("search");
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [stats, setStats] = useState(null);
+  const [summary, setSummary] = useState("");
+  const [summarizing, setSummarizing] = useState(false);
 
   useEffect(() => {
-    api.get("/knowledge/assignments").then(setAssignments).catch(() => {});
+    api.get("/knowledge/stats").then(setStats).catch(() => {});
   }, [api]);
 
-  const filtered = assignments.filter((a) =>
-    !filter ||
-    a.metadata?.title?.toLowerCase().includes(filter.toLowerCase()) ||
-    a.metadata?.course_name?.toLowerCase().includes(filter.toLowerCase())
-  );
+  const search = async () => {
+    if (!query.trim()) return;
+    setSearching(true);
+    setResults(null);
+    try {
+      const [searchRes, docRes] = await Promise.all([
+        api.post("/knowledge/search", { message: query }),
+        api.post("/documents/search", { message: query }),
+      ]);
+      setResults({
+        assignments: searchRes.assignments || [],
+        content: searchRes.content || [],
+        documents: docRes.results || [],
+      });
+    } catch {
+      setResults({ assignments: [], content: [], documents: [] });
+    }
+    setSearching(false);
+  };
 
-  // Group by course_name
-  const grouped = filtered.reduce((acc, a) => {
-    const course = a.metadata?.course_name || "Unknown Course";
-    if (!acc[course]) acc[course] = [];
-    acc[course].push(a);
-    return acc;
-  }, {});
+  const generateSummary = async () => {
+    setSummarizing(true);
+    setSummary("");
+    try {
+      const res = await api.post("/chat", {
+        message: "Give me a comprehensive summary of everything you know about my courses. Include: what courses I am in, key themes from each course, major assignments, and important concepts from the readings and materials you have read. Be specific and detailed.",
+      });
+      setSummary(res.reply || "");
+    } catch {
+      setSummary("Error generating summary — make sure the AI model is configured and credits are added.");
+    }
+    setSummarizing(false);
+  };
 
   return (
-    <div>
-      <input value={filter} onChange={(e) => setFilter(e.target.value)}
-        placeholder="Filter by course or title…"
-        style={{ width: "100%", padding: "10px 14px", background: "#1f2937", border: "1px solid #374151",
-          borderRadius: 8, color: "#f9fafb", fontSize: 13, fontFamily: "inherit",
-          marginBottom: 20, boxSizing: "border-box" }} />
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
 
-      {Object.keys(grouped).length === 0 && <EmptyState label="No knowledge found. Run a crawl to populate." />}
-
-      {Object.entries(grouped).map(([courseName, items]) => (
-        <div key={courseName} style={{ marginBottom: 24 }}>
-          <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", textTransform: "uppercase",
-            letterSpacing: "0.08em", marginBottom: 8, paddingBottom: 6,
-            borderBottom: "1px solid #1f2937" }}>
-            {courseName} ({items.length})
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {items.map((a, i) => (
-              <div key={i} style={{ padding: "10px 14px", background: "#1f2937", borderRadius: 8,
-                display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div>
-                  <div style={{ fontSize: 13, fontWeight: 500, color: "#f9fafb" }}>{a.metadata?.title}</div>
-                  <div style={{ fontSize: 11, color: "#6b7280", marginTop: 2 }}>
-                    Due: {a.metadata?.due || "No due date"}
-                    {a.metadata?.points ? ` · ${a.metadata.points}` : ""}
-                  </div>
-                </div>
-                <div style={{ fontSize: 11, padding: "3px 10px", borderRadius: 20, flexShrink: 0,
-                  background: a.metadata?.status === "submitted" ? "#14532d44" :
-                               a.metadata?.status === "approved" ? "#1e3a5f44" : "#1f2937",
-                  color: a.metadata?.status === "submitted" ? "#22c55e" :
-                         a.metadata?.status === "approved" ? "#60a5fa" : "#6b7280",
-                  border: "1px solid currentColor" }}>
-                  {a.metadata?.status || "pending"}
-                </div>
-              </div>
-            ))}
-          </div>
+      {stats && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+          {[["Assignments", stats.assignments], ["Documents", stats.documents],
+            ["Course Content", stats.course_content], ["Voice Samples", stats.voice_samples]].map(([label, val]) => (
+            <div key={label} style={{ padding: "12px 16px", background: "#1f2937", borderRadius: 10 }}>
+              <div style={{ fontSize: 22, fontWeight: 700, color: "#f9fafb" }}>{val ?? "—"}</div>
+              <div style={{ fontSize: 11, color: "#6b7280", marginTop: 2 }}>{label}</div>
+            </div>
+          ))}
         </div>
-      ))}
+      )}
+
+      <div style={{ display: "flex", gap: 4 }}>
+        {["search", "summary"].map((t) => (
+          <button key={t} onClick={() => setTab(t)} style={{
+            padding: "6px 16px", borderRadius: 20, border: "none", cursor: "pointer",
+            background: tab === t ? "#1d4ed8" : "#1f2937", color: "#f9fafb",
+            fontSize: 13, fontFamily: "inherit", fontWeight: tab === t ? 600 : 400,
+          }}>
+            {t === "search" ? "Search Knowledge" : "AI Course Summary"}
+          </button>
+        ))}
+      </div>
+
+      {tab === "search" && (
+        <div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+            <input value={query} onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && search()}
+              placeholder="Search across assignments, documents, readings, syllabi, modules…"
+              style={{ ...inputStyle, flex: 1 }} />
+            <Btn onClick={search} disabled={searching || !query.trim()}>
+              {searching ? "Searching…" : "Search"}
+            </Btn>
+          </div>
+
+          {!results && (
+            <div style={{ fontSize: 13, color: "#4b5563", textAlign: "center", padding: 32 }}>
+              Search across everything the agent has read — syllabi, readings, documents, and assignments.
+            </div>
+          )}
+
+          {results && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              {[
+                { key: "documents", label: "Documents & Readings" },
+                { key: "content",   label: "Course Content" },
+                { key: "assignments", label: "Assignments" },
+              ].map(({ key, label }) =>
+                results[key]?.length > 0 ? (
+                  <div key={key}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280",
+                      textTransform: "uppercase", letterSpacing: ".07em", marginBottom: 8 }}>
+                      {label} ({results[key].length})
+                    </div>
+                    {results[key].map((r, i) => <KnowledgeCard key={i} result={r} />)}
+                  </div>
+                ) : null
+              )}
+              {results.documents?.length === 0 && results.content?.length === 0 && results.assignments?.length === 0 && (
+                <EmptyState label="No results found. Try different keywords." />
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === "summary" && (
+        <div>
+          <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 14 }}>
+            Ask the agent to summarize what it knows — courses, key concepts, assignments, and material it has read.
+          </p>
+          <Btn onClick={generateSummary} disabled={summarizing} style={{ marginBottom: 16 }}>
+            {summarizing ? "Generating…" : "Generate Course Knowledge Summary"}
+          </Btn>
+          {summary && (
+            <div style={{ padding: 20, background: "#1f2937", borderRadius: 12,
+              fontSize: 13, color: "#d1d5db", lineHeight: 1.8, whiteSpace: "pre-wrap" }}>
+              {summary}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
+
+function KnowledgeCard({ result }) {
+  const [expanded, setExpanded] = useState(false);
+  const meta = result.metadata || {};
+  const text = result.document || "";
+  const preview = text.slice(0, 300);
+  const hasMore = text.length > 300;
+  return (
+    <div style={{ padding: "12px 16px", background: "#1f2937", borderRadius: 10, marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 600, color: "#f9fafb" }}>
+            {meta.title || meta.assignment || meta.module_name || meta.type || "Content"}
+          </div>
+          <div style={{ fontSize: 11, color: "#6b7280", marginTop: 2 }}>
+            {meta.course_name || ""}
+            {meta.doc_type ? ` · ${meta.doc_type}` : ""}
+            {meta.type && meta.type !== meta.doc_type ? ` · ${meta.type}` : ""}
+          </div>
+        </div>
+        {result.distance != null && (
+          <div style={{ fontSize: 10, color: "#6b7280", background: "#111827",
+            padding: "2px 8px", borderRadius: 20, flexShrink: 0 }}>
+            {Math.round((1 - result.distance) * 100)}% match
+          </div>
+        )}
+      </div>
+      <div style={{ fontSize: 12, color: "#9ca3af", lineHeight: 1.6 }}>
+        {expanded ? text : preview}{hasMore && !expanded && "…"}
+      </div>
+      {hasMore && (
+        <button onClick={() => setExpanded(!expanded)}
+          style={{ fontSize: 11, color: "#3b82f6", background: "none", border: "none", cursor: "pointer", padding: "4px 0 0" }}>
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+
 
 // ------------------------------------------------------------------ //
 // Documents panel — flagged external links + manual upload
