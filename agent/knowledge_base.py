@@ -29,6 +29,25 @@ def _default_chroma_dir() -> str:
     return str(Path(data_dir) / "knowledge" / "chroma")
 
 
+def _build_where(course_name=None, note_type=None) -> dict:
+    """Build a ChromaDB where-filter supporting optional course_name and note_type."""
+    if course_name and note_type:
+        return {"$and": [{"course_name": course_name}, {"note_type": note_type}]}
+    if course_name:
+        return {"course_name": course_name}
+    if note_type:
+        return {"note_type": note_type}
+    return {}
+
+
+def _zip_results(r: dict) -> list:
+    """Zip ChromaDB get() ids/documents/metadatas into a list of dicts."""
+    ids = r.get("ids") or []
+    docs = r.get("documents") or []
+    metas = r.get("metadatas") or []
+    return [{"id": ids[i], "document": docs[i], "metadata": metas[i]} for i in range(len(ids))]
+
+
 def _chunk_text(text: str, max_chars: int = 6000) -> list[str]:
     """
     Split text into semantically coherent chunks of at most max_chars.
@@ -79,6 +98,11 @@ class KnowledgeBase:
         self.flagged_links = self._get_or_create("flagged_links")
         self.voice_profile = self._get_or_create("voice_profile")
         self.instructor_patterns = self._get_or_create("instructor_patterns")
+        # Learning system collections
+        self.ai_notes = self._get_or_create("ai_notes")
+        self.topics = self._get_or_create("topics")
+        self.concepts = self._get_or_create("concepts")
+        self.chat_history = self._get_or_create("chat_history")
 
     def _get_or_create(self, name: str):
         return self.client.get_or_create_collection(
@@ -539,13 +563,13 @@ class KnowledgeBase:
         }
 
     def get_all_assignments(self) -> list:
-        """Return all assignment documents and metadata."""
+        """Return all assignment documents and metadata (includes ChromaDB id)."""
         count = self.assignments.count()
         if count == 0:
             return []
-        results = self.assignments.get(include=["documents", "metadatas"])
+        results = self.assignments.get(include=["documents", "metadatas", "ids"])
         return [
-            {"document": doc, "metadata": results["metadatas"][i]}
+            {"id": results["ids"][i], "document": doc, "metadata": results["metadatas"][i]}
             for i, doc in enumerate(results["documents"])
         ]
 
@@ -643,4 +667,174 @@ class KnowledgeBase:
             "flagged_external": self.flagged_links.count(),
             "voice_samples": self.voice_profile.count(),
             "instructor_patterns": self.instructor_patterns.count(),
+            "ai_notes": self.ai_notes.count(),
+            "topics": self.topics.count(),
+            "concepts": self.concepts.count(),
+            "chat_history": self.chat_history.count(),
         }
+
+    # ------------------------------------------------------------------ #
+    #  AI Notes                                                            #
+    # ------------------------------------------------------------------ #
+
+    def save_ai_note(self, note_id: str, text: str, metadata: dict) -> None:
+        """Upsert an AI-generated note linked to a source document."""
+        self.ai_notes.upsert(ids=[note_id], documents=[text], metadatas=[metadata])
+
+    def get_all_notes(self, course_name: Optional[str] = None, note_type: Optional[str] = None) -> list:
+        """Return all AI notes, optionally filtered by course or note_type."""
+        count = self.ai_notes.count()
+        if count == 0:
+            return []
+        where = _build_where(course_name=course_name, note_type=note_type)
+        kwargs: dict = {"include": ["documents", "metadatas", "ids"]}
+        if where:
+            kwargs["where"] = where
+        try:
+            return _zip_results(self.ai_notes.get(**kwargs))
+        except Exception as e:
+            logger.error(f"Error fetching notes: {e}")
+            return []
+
+    def search_ai_notes(self, query: str, course_name: Optional[str] = None,
+                        note_type: Optional[str] = None, n: int = 10) -> list:
+        """Semantic search over AI notes."""
+        count = self.ai_notes.count()
+        if count == 0:
+            return []
+        where = _build_where(course_name=course_name, note_type=note_type)
+        kwargs: dict = {"query_texts": [query], "n_results": min(n, count)}
+        if where:
+            kwargs["where"] = where
+        try:
+            return self._format_results(self.ai_notes.query(**kwargs))
+        except Exception as e:
+            logger.error(f"Error searching notes: {e}")
+            return []
+
+    def get_notes_for_source(self, source_doc_id: str) -> list:
+        """Return all AI notes linked to a specific source document."""
+        try:
+            r = self.ai_notes.get(
+                where={"source_doc_id": source_doc_id},
+                include=["documents", "metadatas", "ids"],
+            )
+            return _zip_results(r)
+        except Exception as e:
+            logger.error(f"Error fetching notes for {source_doc_id}: {e}")
+            return []
+
+    def get_documents_first_chunks(self, course_name: Optional[str] = None) -> list:
+        """Return chunk=0 entries only — one per source document — with ChromaDB ids."""
+        count = self.documents.count()
+        if count == 0:
+            return []
+        try:
+            if course_name:
+                where = {"$and": [{"chunk": 0}, {"course_name": course_name}]}
+            else:
+                where = {"chunk": 0}
+            r = self.documents.get(where=where, include=["documents", "metadatas", "ids"])
+            return _zip_results(r)
+        except Exception as e:
+            logger.error(f"Error fetching document first chunks: {e}")
+            return []
+
+    # ------------------------------------------------------------------ #
+    #  Topics                                                              #
+    # ------------------------------------------------------------------ #
+
+    def save_topic(self, topic_id: str, text: str, metadata: dict) -> None:
+        """Upsert a synthesized topic overview."""
+        self.topics.upsert(ids=[topic_id], documents=[text], metadatas=[metadata])
+
+    def get_all_topics(self, course_name: Optional[str] = None) -> list:
+        """Return all topics, optionally filtered by course."""
+        count = self.topics.count()
+        if count == 0:
+            return []
+        kwargs: dict = {"include": ["documents", "metadatas", "ids"]}
+        if course_name:
+            kwargs["where"] = {"course_name": course_name}
+        try:
+            return _zip_results(self.topics.get(**kwargs))
+        except Exception as e:
+            logger.error(f"Error fetching topics: {e}")
+            return []
+
+    def search_topics(self, query: str, course_name: Optional[str] = None, n: int = 5) -> list:
+        """Semantic search over synthesized topic overviews."""
+        count = self.topics.count()
+        if count == 0:
+            return []
+        kwargs: dict = {"query_texts": [query], "n_results": min(n, count)}
+        if course_name:
+            kwargs["where"] = {"course_name": course_name}
+        try:
+            return self._format_results(self.topics.query(**kwargs))
+        except Exception as e:
+            logger.error(f"Error searching topics: {e}")
+            return []
+
+    # ------------------------------------------------------------------ #
+    #  Concepts                                                            #
+    # ------------------------------------------------------------------ #
+
+    def save_concept(self, concept_id: str, text: str, metadata: dict) -> None:
+        """Upsert an atomic concept definition."""
+        self.concepts.upsert(ids=[concept_id], documents=[text], metadatas=[metadata])
+
+    def get_concepts_for_topic(self, topic_id: str) -> list:
+        """Return all concepts linked to a topic."""
+        try:
+            r = self.concepts.get(
+                where={"topic_id": topic_id},
+                include=["documents", "metadatas", "ids"],
+            )
+            return _zip_results(r)
+        except Exception as e:
+            logger.error(f"Error fetching concepts for {topic_id}: {e}")
+            return []
+
+    def search_concepts(self, query: str, course_name: Optional[str] = None, n: int = 8) -> list:
+        """Semantic search over extracted concepts."""
+        count = self.concepts.count()
+        if count == 0:
+            return []
+        kwargs: dict = {"query_texts": [query], "n_results": min(n, count)}
+        if course_name:
+            kwargs["where"] = {"course_name": course_name}
+        try:
+            return self._format_results(self.concepts.query(**kwargs))
+        except Exception as e:
+            logger.error(f"Error searching concepts: {e}")
+            return []
+
+    # ------------------------------------------------------------------ #
+    #  Chat History                                                        #
+    # ------------------------------------------------------------------ #
+
+    def save_chat_message(self, message_id: str, role: str, content: str, metadata: dict) -> None:
+        """Persist a single chat turn permanently."""
+        self.chat_history.upsert(
+            ids=[message_id],
+            documents=[content],
+            metadatas=[{"role": role, **metadata}],
+        )
+
+    def get_recent_chat_history(self, n: int = 40) -> list:
+        """Return the n most recent chat messages, sorted newest first."""
+        count = self.chat_history.count()
+        if count == 0:
+            return []
+        try:
+            r = self.chat_history.get(
+                include=["documents", "metadatas", "ids"],
+                limit=min(n * 2, count),  # fetch extra then sort+trim
+            )
+            items = _zip_results(r)
+            items.sort(key=lambda x: x["metadata"].get("timestamp", ""), reverse=True)
+            return items[:n]
+        except Exception as e:
+            logger.error(f"Error fetching chat history: {e}")
+            return []
