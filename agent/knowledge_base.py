@@ -276,6 +276,10 @@ class KnowledgeBase:
                     f"Rubric: {rubric_json}"
                 ).strip()
 
+                # Preserve existing status so approved/submitted work survives re-crawls
+                existing = self.get_assignment_by_id(aid)
+                current_status = existing["metadata"].get("status", "pending") if existing else "pending"
+
                 assign_ids.append(f"assignment_{course_id}_{aid}")
                 assign_docs.append(doc)
                 assign_metas.append({
@@ -287,7 +291,7 @@ class KnowledgeBase:
                     "due": assignment.get("due", "No due date"),
                     "points": assignment.get("points", ""),
                     "url": assignment.get("url", ""),
-                    "status": "pending",
+                    "status": current_status,
                 })
 
             if assign_ids:
