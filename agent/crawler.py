@@ -136,17 +136,20 @@ class CanvasCrawler:
 
     async def start(self, headless: bool = True) -> None:
         """Launch headless Chromium and inject Canvas session cookies."""
+        logger.debug("[start] Launching Playwright")
         self._pw = await async_playwright().start()
 
         # If PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH is set (e.g. pointing to the
         # Nix-installed chromium on Railway), use it directly so we don't depend
         # on Playwright's own downloaded browser binary which may be missing libs.
         executable_path = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or None
+        logger.debug(f"[start] headless={headless} executable_path={executable_path!r}")
 
         browser = await self._pw.chromium.launch(
             headless=headless,
             executable_path=executable_path,
         )
+        logger.debug("[start] Chromium launched — creating browser context")
         self.context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -155,6 +158,7 @@ class CanvasCrawler:
             )
         )
         cookies = await self.load_cookies()
+        logger.debug(f"[start] Injecting {len(cookies)} cookies into browser context")
         await self.context.add_cookies(cookies)
         self.page = await self.context.new_page()
         logger.info("Browser started with Canvas session cookies")
@@ -182,7 +186,9 @@ class CanvasCrawler:
 
     async def verify_session(self) -> bool:
         """Return True if session cookies grant an authenticated Canvas session."""
+        logger.debug(f"[verify_session] Navigating to {self.base_url}/profile")
         await self._goto(f"{self.base_url}/profile")
+        logger.debug(f"[verify_session] Landed on: {self.page.url}")
         if "login" in self.page.url.lower():
             logger.error("Session invalid — cookies may have expired")
             return False
@@ -197,15 +203,20 @@ class CanvasCrawler:
         """Return all active enrolled courses from the Canvas dashboard."""
         # Canvas dashboard cards are at the root URL, not /courses.
         # /courses shows an enrollment list without the ic-DashboardCard elements.
+        logger.debug(f"[get_courses] Navigating to dashboard: {self.base_url}/")
         await self._goto(f"{self.base_url}/")
         await self.page.wait_for_timeout(2000)  # cards load via JS after networkidle
         await self._save_page_snapshot("00_dashboard")
 
+        cards = await self.page.query_selector_all(".ic-DashboardCard")
+        logger.debug(f"[get_courses] Found {len(cards)} dashboard cards — parsing each")
+
         courses = []
-        for card in await self.page.query_selector_all(".ic-DashboardCard"):
+        for card in cards:
             try:
                 link = await card.query_selector("a.ic-DashboardCard__link")
                 if not link:
+                    logger.debug("[get_courses] Card has no .ic-DashboardCard__link — skipping")
                     continue
 
                 href = await link.get_attribute("href") or ""
@@ -235,6 +246,7 @@ class CanvasCrawler:
             logger.warning("No dashboard cards found — falling back to Canvas REST API")
             courses = await self._get_courses_via_api()
 
+        logger.debug(f"[get_courses] Returning {len(courses)} courses")
         return courses
 
     async def _get_courses_via_api(self) -> list:
@@ -271,6 +283,7 @@ class CanvasCrawler:
 
     async def get_assignments(self, course_id: str) -> list:
         """Return all assignments for a course."""
+        logger.debug(f"[get_assignments] course_id={course_id} — navigating to assignments page")
         await self._goto(f"{self.base_url}/courses/{course_id}/assignments")
         # Wait briefly for React to render — primary selector often doesn't appear
         # so we proceed quickly to the link fallback which always works
@@ -280,6 +293,7 @@ class CanvasCrawler:
 
         # Try primary Canvas selectors (.assignment-group > .assignment)
         groups = await self.page.query_selector_all(".assignment-group")
+        logger.debug(f"[get_assignments] course_id={course_id} — found {len(groups)} .assignment-group elements")
         if groups:
             for group in groups:
                 for item in await group.query_selector_all(".assignment"):
@@ -307,6 +321,7 @@ class CanvasCrawler:
         if not assignments:
             logger.info(f"Using link fallback for course {course_id}")
             links = await self.page.query_selector_all("a[href*='/assignments/']")
+            logger.debug(f"[get_assignments] Link fallback found {len(links)} assignment links")
             seen = set()
             for link in links:
                 try:
@@ -333,14 +348,17 @@ class CanvasCrawler:
                 except Exception as e:
                     logger.warning(f"Error in link fallback: {e}")
 
+        logger.debug(f"[get_assignments] course_id={course_id} — returning {len(assignments)} assignments")
         return assignments
 
     async def get_assignment_details(self, assignment_url: str) -> dict:
         """Return description, submission types, points, and rubric for one assignment."""
+        logger.debug(f"[get_assignment_details] Navigating to {assignment_url}")
         await self._goto(assignment_url)
         try:
             await self.page.wait_for_selector("#assignment_description, .assignment-description", timeout=8000)
         except Exception:
+            logger.debug(f"[get_assignment_details] Selector timeout — falling back to 2s wait for {assignment_url}")
             await self.page.wait_for_timeout(2000)
 
         details: dict = {
@@ -354,25 +372,32 @@ class CanvasCrawler:
             desc_el = await self.page.query_selector("#assignment_description")
             if desc_el:
                 details["description"] = await desc_el.inner_text()
+                logger.debug(f"[get_assignment_details] Description: {len(details['description'])} chars")
+            else:
+                logger.debug(f"[get_assignment_details] No #assignment_description found at {assignment_url}")
 
-            details["submission_types"] = [
-                await el.inner_text()
-                for el in await self.page.query_selector_all(".submission_type")
-            ]
+            sub_els = await self.page.query_selector_all(".submission_type")
+            details["submission_types"] = [await el.inner_text() for el in sub_els]
+            logger.debug(f"[get_assignment_details] submission_types={details['submission_types']}")
 
             pts_el = await self.page.query_selector(".points_possible")
             if pts_el:
                 details["points_possible"] = await pts_el.inner_text()
+                logger.debug(f"[get_assignment_details] points_possible={details['points_possible']!r}")
 
-            for row in await self.page.query_selector_all(".rubric_criterion"):
+            rubric_rows = await self.page.query_selector_all(".rubric_criterion")
+            logger.debug(f"[get_assignment_details] Found {len(rubric_rows)} rubric criteria rows")
+            for row in rubric_rows:
                 desc = await row.query_selector(".description")
                 long_desc = await row.query_selector(".long_description")
                 pts = await row.query_selector(".criterion_points")
+                criterion = await desc.inner_text() if desc else ""
                 details["rubric"].append({
-                    "criterion": await desc.inner_text() if desc else "",
+                    "criterion": criterion,
                     "description": await long_desc.inner_text() if long_desc else "",
                     "points": await pts.inner_text() if pts else "",
                 })
+                logger.debug(f"[get_assignment_details] Rubric criterion: {criterion!r}")
 
         except Exception as e:
             logger.warning(f"Error parsing details at {assignment_url}: {e}", exc_info=True)
@@ -398,14 +423,18 @@ class CanvasCrawler:
 
     async def get_announcements(self, course_id: str) -> list:
         """Return all announcements for a course."""
+        logger.debug(f"[get_announcements] course_id={course_id}")
         await self._goto(f"{self.base_url}/courses/{course_id}/announcements")
         try:
             await self.page.wait_for_selector(".ic-announcement-row, .discussion-topic", timeout=8000)
         except Exception:
+            logger.debug(f"[get_announcements] Selector timeout — falling back to 2s wait")
             await self.page.wait_for_timeout(2000)
 
+        rows = await self.page.query_selector_all(".ic-announcement-row")
+        logger.debug(f"[get_announcements] Found {len(rows)} .ic-announcement-row elements")
         announcements = []
-        for item in await self.page.query_selector_all(".ic-announcement-row"):
+        for item in rows:
             try:
                 # Actual Canvas HTML uses a.ic-item-row__content-link for the title —
                 # .ic-announcement-row__content-title does not exist in the rendered DOM.
@@ -413,13 +442,13 @@ class CanvasCrawler:
                 date_el = await item.query_selector("time")
                 title = (await title_el.inner_text()).strip() if title_el else ""
                 if title:
-                    announcements.append({
-                        "title": title,
-                        "date": await date_el.get_attribute("datetime") if date_el else "",
-                    })
+                    date_val = await date_el.get_attribute("datetime") if date_el else ""
+                    logger.debug(f"[get_announcements] Announcement: {title!r} date={date_val!r}")
+                    announcements.append({"title": title, "date": date_val})
             except Exception as e:
                 logger.warning(f"Error parsing announcement: {e}", exc_info=True)
 
+        logger.debug(f"[get_announcements] Returning {len(announcements)} announcements for course {course_id}")
         return announcements
 
     # ------------------------------------------------------------------ #
@@ -428,17 +457,21 @@ class CanvasCrawler:
 
     async def get_modules(self, course_id: str) -> list:
         """Return all modules and their items for a course."""
+        logger.debug(f"[get_modules] course_id={course_id}")
         await self._goto(f"{self.base_url}/courses/{course_id}/modules")
         try:
             await self.page.wait_for_selector(".context_module", timeout=8000)
         except Exception:
+            logger.debug(f"[get_modules] Selector timeout — falling back to 2s wait")
             await self.page.wait_for_timeout(2000)
         # Extra settle time for Canvas's React to finish populating item hrefs.
         # Without this, ExternalTool items have {{ id }} placeholder hrefs.
         await self.page.wait_for_timeout(3000)
 
+        mod_els = await self.page.query_selector_all(".context_module")
+        logger.debug(f"[get_modules] Found {len(mod_els)} .context_module elements")
         modules = []
-        for mod in await self.page.query_selector_all(".context_module"):
+        for mod in mod_els:
             try:
                 name_el = await mod.query_selector(".ig-header-title")
                 name = (await name_el.inner_text()).strip() if name_el else "Unnamed Module"
@@ -458,11 +491,13 @@ class CanvasCrawler:
                             "url": f"{self.base_url}{item_href}" if item_href.startswith("/") else item_href,
                         })
 
+                logger.debug(f"[get_modules] Module: {name!r} — {len(items)} items")
                 modules.append({"name": name, "items": items})
 
             except Exception as e:
                 logger.warning(f"Error parsing module: {e}", exc_info=True)
 
+        logger.debug(f"[get_modules] Returning {len(modules)} modules for course {course_id}")
         return modules
 
     # ------------------------------------------------------------------ #
@@ -471,14 +506,18 @@ class CanvasCrawler:
 
     async def get_grades(self, course_id: str) -> list:
         """Return all graded assignments for a course."""
+        logger.debug(f"[get_grades] course_id={course_id}")
         await self._goto(f"{self.base_url}/courses/{course_id}/grades")
         try:
             await self.page.wait_for_selector("tr.student_assignment, .gradebook-cell", timeout=8000)
         except Exception:
+            logger.debug(f"[get_grades] Selector timeout — falling back to 2s wait")
             await self.page.wait_for_timeout(2000)
 
+        grade_rows = await self.page.query_selector_all("tr.student_assignment")
+        logger.debug(f"[get_grades] Found {len(grade_rows)} tr.student_assignment rows")
         grades = []
-        for row in await self.page.query_selector_all("tr.student_assignment"):
+        for row in grade_rows:
             try:
                 title_el = await row.query_selector(".title a")
                 # Actual Canvas HTML: score is inside td.assignment_score > span.grade;
@@ -490,15 +529,20 @@ class CanvasCrawler:
 
                 title = (await title_el.inner_text()).strip() if title_el else ""
                 if title:
+                    score_val = (await score_el.inner_text()).strip() if score_el else "-"
+                    possible_val = (await possible_el.inner_text()).strip().lstrip("/ ") if possible_el else "-"
+                    due_val = (await due_el.inner_text()).strip() if due_el else ""
+                    logger.debug(f"[get_grades] Grade: {title!r} score={score_val!r}/{possible_val!r} due={due_val!r}")
                     grades.append({
                         "assignment": title,
-                        "score": (await score_el.inner_text()).strip() if score_el else "-",
-                        "possible": (await possible_el.inner_text()).strip().lstrip("/ ") if possible_el else "-",
-                        "due": (await due_el.inner_text()).strip() if due_el else "",
+                        "score": score_val,
+                        "possible": possible_val,
+                        "due": due_val,
                     })
             except Exception as e:
                 logger.warning(f"Error parsing grade row: {e}", exc_info=True)
 
+        logger.debug(f"[get_grades] Returning {len(grades)} grade records for course {course_id}")
         return grades
 
     # ------------------------------------------------------------------ #
@@ -507,10 +551,16 @@ class CanvasCrawler:
 
     async def get_syllabus(self, course_id: str) -> str:
         """Return the plain-text syllabus for a course."""
+        logger.debug(f"[get_syllabus] course_id={course_id}")
         await self._goto(f"{self.base_url}/courses/{course_id}/assignments/syllabus")
         await self.page.wait_for_timeout(500)
         el = await self.page.query_selector("#course_syllabus")
-        return (await el.inner_text()) if el else ""
+        if el:
+            text = await el.inner_text()
+            logger.debug(f"[get_syllabus] Found syllabus: {len(text)} chars for course {course_id}")
+            return text
+        logger.debug(f"[get_syllabus] No #course_syllabus element found for course {course_id}")
+        return ""
 
     # ------------------------------------------------------------------ #
     #  Page snapshot saving                                               #
@@ -550,7 +600,13 @@ class CanvasCrawler:
         self.knowledge["crawled_at"] = datetime.now().isoformat()
         self.knowledge["courses"] = []
 
+        logger.debug("[crawl_all] Fetching course list from dashboard")
         courses = await self.get_courses()
+        logger.debug(f"[crawl_all] {len(courses)} total courses found on dashboard")
+
+        enrolled = [c for c in courses if _is_real_course(c)]
+        skipped = [c for c in courses if not _is_real_course(c)]
+        logger.debug(f"[crawl_all] {len(enrolled)} enrolled courses (have CRN), {len(skipped)} will be skipped")
 
         for course in courses:
             cid = course["id"]
@@ -562,26 +618,38 @@ class CanvasCrawler:
                 continue
 
             logger.info(f"[CRAWL] {course['name']}")
+            logger.debug(f"[crawl_all] --- Starting full crawl of course id={cid} ---")
 
+            logger.debug(f"[crawl_all] Fetching syllabus for {course['name']}")
             raw_syllabus = await self.get_syllabus(cid)
             await self._save_page_snapshot(f"{slug}_{cid}_syllabus")
             if raw_syllabus:
+                logger.debug(f"[crawl_all] Syllabus found ({len(raw_syllabus)} chars) — enriching with AI")
                 from agent.brain import enrich_for_knowledge_base
                 course["syllabus"] = await enrich_for_knowledge_base(
                     raw_syllabus, "Syllabus", course["name"], "syllabus"
                 )
+                logger.debug(f"[crawl_all] Syllabus enriched: {len(course['syllabus'])} chars")
             else:
+                logger.debug(f"[crawl_all] No syllabus found for {course['name']}")
                 course["syllabus"] = raw_syllabus
 
+            logger.debug(f"[crawl_all] Fetching announcements for {course['name']}")
             course["announcements"] = await self.get_announcements(cid)
             await self._save_page_snapshot(f"{slug}_{cid}_announcements")
+            logger.debug(f"[crawl_all] Got {len(course['announcements'])} announcements")
 
+            logger.debug(f"[crawl_all] Fetching modules for {course['name']}")
             course["modules"] = await self.get_modules(cid)
             await self._save_page_snapshot(f"{slug}_{cid}_modules")
+            logger.debug(f"[crawl_all] Got {len(course['modules'])} modules")
 
+            logger.debug(f"[crawl_all] Fetching grades for {course['name']}")
             course["grades"] = await self.get_grades(cid)
             await self._save_page_snapshot(f"{slug}_{cid}_grades")
+            logger.debug(f"[crawl_all] Got {len(course['grades'])} grade records")
 
+            logger.debug(f"[crawl_all] Fetching assignments for {course['name']}")
             assignments = await self.get_assignments(cid)
             await self._save_page_snapshot(f"{slug}_{cid}_assignments")
             logger.info(f"  Found {len(assignments)} assignments")
@@ -591,6 +659,7 @@ class CanvasCrawler:
             # the user generates a specific assignment.
             for a in assignments:
                 logger.info(f"  -> {a['title']}")
+                logger.debug(f"[crawl_all]    id={a['id']} due={a.get('due')!r} points={a.get('points')!r}")
                 a["details"] = {}  # populated on-demand via get_assignment_details()
 
             course["assignments"] = assignments
@@ -598,6 +667,7 @@ class CanvasCrawler:
             # RF-Ingester-bypass: pass _polite_goto so the ingester uses
             # the same rate-limiting behaviour as the crawler.
             logger.info(f"  Ingesting documents for: {course['name']}")
+            logger.debug(f"[crawl_all] Creating DocumentIngester for {course['name']}")
             ingester = DocumentIngester(
                 page=self.page,
                 base_url=self.base_url,
@@ -610,10 +680,12 @@ class CanvasCrawler:
                 f"  Documents: {len(doc_results['ingested'])} ingested, "
                 f"{len(doc_results['flagged'])} flagged"
             )
+            logger.debug(f"[crawl_all] --- Finished course: {course['name']} ---")
 
             self.knowledge["courses"].append(course)
 
         logger.info(f"[DONE] Crawl complete -- {len(courses)} courses indexed")  # RF-24
+        logger.debug(f"[crawl_all] Knowledge snapshot: {len(self.knowledge['courses'])} courses stored")
         return self.knowledge
 
     async def save_knowledge(self, path: str = "") -> None:

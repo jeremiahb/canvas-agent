@@ -49,8 +49,10 @@ def _get_client():
     """
     global _client
     if _client is not None:
+        logger.debug("[_get_client] Returning cached AI client")
         return _client
 
+    logger.debug("[_get_client] First call — initialising AI client")
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 
@@ -116,7 +118,9 @@ async def describe_page_visuals(screenshot_bytes: bytes, context: str = "") -> s
     Returns an empty string (silently) if vision is disabled or unavailable,
     so callers can always do: text += await describe_page_visuals(...) safely.
     """
+    logger.debug(f"[describe_page_visuals] Called for context={context!r} screenshot={len(screenshot_bytes):,} bytes")
     if os.environ.get("VISION_ENABLED", "").lower() not in ("1", "true"):
+        logger.debug("[describe_page_visuals] VISION_ENABLED is not set — skipping")
         return ""
 
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
@@ -125,6 +129,7 @@ async def describe_page_visuals(screenshot_bytes: bytes, context: str = "") -> s
         return ""
 
     vision_model = os.environ.get("VISION_MODEL", _VISION_MODEL_DEFAULT)
+    logger.debug(f"[describe_page_visuals] Using vision model: {vision_model}")
 
     try:
         from openai import AsyncOpenAI
@@ -183,9 +188,12 @@ async def enrich_for_knowledge_base(
     Uses asyncio.get_running_loop().run_in_executor to call the synchronous
     _call_api without blocking the Playwright event loop.
     """
+    logger.debug(f"[enrich_for_knowledge_base] title={title!r} course={course_name!r} doc_type={doc_type!r} text_len={len(text)}")
     if os.environ.get("AI_ENRICHMENT_ENABLED", "").lower() not in ("1", "true"):
+        logger.debug("[enrich_for_knowledge_base] AI_ENRICHMENT_ENABLED is not set — returning raw text")
         return text
     if not text.strip():
+        logger.debug("[enrich_for_knowledge_base] Empty text — skipping enrichment")
         return text
 
     context_lines = []
@@ -220,15 +228,18 @@ async def enrich_for_knowledge_base(
         "Use headings and bullet points. Skip only pure navigation/boilerplate HTML text."
     )
 
+    logger.debug(f"[enrich_for_knowledge_base] Sending {len(truncated):,} chars to AI for enrichment")
     try:
         loop = asyncio.get_running_loop()
         summary = await loop.run_in_executor(None, lambda: _call_api(prompt))
         if summary:
             logger.info(f"Enriched: {title!r} ({len(summary)} chars summary)")
+            logger.debug(f"[enrich_for_knowledge_base] Enrichment complete for {title!r} — total stored: {len(text) + len(summary)} chars")
             return text + f"\n\n[AI KNOWLEDGE SUMMARY]\n{summary}"
     except Exception as e:
         logger.warning(f"AI enrichment failed for {title!r}: {e}")
 
+    logger.debug(f"[enrich_for_knowledge_base] Returning original text (no enrichment) for {title!r}")
     return text
 
 
@@ -310,22 +321,32 @@ def _call_api(system: str, messages: list, max_tokens: int = 2048):
     normalises them so callers don't need to care.
     """
     client = _get_client()
+    provider = "OpenRouter" if hasattr(client, "chat") else "Anthropic"
+    msg_count = len(messages)
+    last_msg_preview = (messages[-1].get("content", "") if messages else "")[:80] if messages else ""
+    logger.debug(f"[_call_api] {provider} | model={_AI_MODEL} | max_tokens={max_tokens} | messages={msg_count} | last_msg={last_msg_preview!r}")
 
     # OpenRouter / OpenAI format
     if hasattr(client, "chat"):
-        return client.chat.completions.create(
+        response = client.chat.completions.create(
             model=_AI_MODEL,
             max_tokens=max_tokens,
             messages=[{"role": "system", "content": system}] + messages,
         )
+        usage = getattr(response, "usage", None)
+        if usage:
+            logger.debug(f"[_call_api] Response tokens — prompt={getattr(usage, 'prompt_tokens', '?')} completion={getattr(usage, 'completion_tokens', '?')}")
+        return response
 
     # Anthropic format
-    return client.messages.create(
+    response = client.messages.create(
         model=_AI_MODEL,
         max_tokens=max_tokens,
         system=system,
         messages=messages,
     )
+    logger.debug(f"[_call_api] Anthropic response — stop_reason={response.stop_reason} input={response.usage.input_tokens} output={response.usage.output_tokens}")
+    return response
 
 
 class AgentBrain:
@@ -455,12 +476,15 @@ class AgentBrain:
 
     def chat(self, user_message: str, course_name: Optional[str] = None) -> str:
         """Multi-turn conversation with the agent."""
+        logger.debug(f"[chat] user_message={user_message[:80]!r} course={course_name!r} history_len={len(self.conversation_history)}")
         self.update_voice_profile()  # RF-VoiceDirty: no-op unless dirty
         context = self.build_context(user_message, course_name=course_name)
+        logger.debug(f"[chat] Context built: {len(context)} chars")
         system = SYSTEM_PROMPT + f"\n\n=== CURRENT CONTEXT ===\n{context}"
 
         self.conversation_history.append({"role": "user", "content": user_message})
         self._trim_history()
+        logger.debug(f"[chat] History after trim: {len(self.conversation_history)} messages — calling AI")
 
         response = _call_api(  # RF-LazyClient, RF-ModelConst
             system=system,
@@ -469,6 +493,7 @@ class AgentBrain:
         )
 
         reply = _extract_text(response)  # RF-ContentIdx
+        logger.debug(f"[chat] AI reply: {len(reply)} chars")
         self.conversation_history.append({"role": "assistant", "content": reply})
         return reply
 
@@ -485,6 +510,7 @@ class AgentBrain:
         Break down an assignment: requirements, rubric, strategy, confidence.
         JSON parse failures are logged and returned as structured errors.
         """
+        logger.debug(f"[analyze_assignment] doc={len(assignment_doc)} chars — building analysis prompt")
         prompt = (
             f"Analyze this assignment thoroughly:\n\n{assignment_doc}\n\n"
             "Provide:\n"
@@ -498,6 +524,7 @@ class AgentBrain:
             "Respond ONLY with valid JSON, no markdown fences."
         )
 
+        logger.debug(f"[analyze_assignment] Calling AI — max_tokens=2048")
         response = _call_api(
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
@@ -505,10 +532,13 @@ class AgentBrain:
         )
 
         raw = _extract_text(response)
+        logger.debug(f"[analyze_assignment] Raw response: {len(raw)} chars — parsing JSON")
         clean = raw.replace("```json", "").replace("```", "").strip()
 
         try:
-            return json.loads(clean)
+            result = json.loads(clean)
+            logger.debug(f"[analyze_assignment] JSON parsed OK — type={result.get('ESTIMATED_TYPE')!r} confidence={result.get('CONFIDENCE')}")
+            return result
         except json.JSONDecodeError as e:
             logger.error(
                 f"Failed to parse analysis JSON: {e}\n"
@@ -528,8 +558,10 @@ class AgentBrain:
 
     def generate_content(self, assignment_doc: str, file_type: str) -> str:
         """Generate complete content for an assignment in the user's voice."""
+        logger.debug(f"[generate_content] file_type={file_type!r} doc={len(assignment_doc)} chars")
         self.update_voice_profile()  # RF-VoiceDirty
         voice_ctx = self.get_voice_context()
+        logger.debug(f"[generate_content] Voice context: {len(voice_ctx)} chars")
 
         prompt = (
             f"Generate complete content for this assignment.\n\n"
@@ -547,13 +579,16 @@ class AgentBrain:
             "For TEXT: Write the complete response"
         )
 
+        logger.debug(f"[generate_content] Calling AI — max_tokens=8096")
         response = _call_api(
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=8096,
         )
 
-        return _extract_text(response)
+        result = _extract_text(response)
+        logger.debug(f"[generate_content] Generated {len(result)} chars of {file_type} content")
+        return result
 
     def generate_daily_briefing(self) -> str:
         """Generate a personalised daily briefing: priorities, upcoming, recommendations."""
