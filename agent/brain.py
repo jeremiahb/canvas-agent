@@ -21,11 +21,9 @@ import json
 import logging
 import os
 import time
-import uuid
 from typing import Optional
 
 from anthropic import Anthropic
-from anthropic.types import Message
 
 from agent.knowledge_base import KnowledgeBase
 
@@ -52,13 +50,12 @@ def _get_client():
         return _client
 
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    anthropic_key  = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 
     if openrouter_key:
         # OpenRouter exposes an OpenAI-compatible API so we use the openai package.
         # It is already installed as a transitive dependency of chromadb.
         try:
-            from openai import AsyncOpenAI  # noqa: F401 — import check only
             from openai import OpenAI
         except ImportError:
             raise RuntimeError(
@@ -91,14 +88,14 @@ _AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-4-20250514")
 # Add $5 at openrouter.ai/settings/credits — free models cost $0 but credits
 # must be present for the account to be activated.
 FREE_MODELS = [
-    {"id": "openrouter/auto",                                 "label": "OpenRouter Auto · picks best available free model"},
-    {"id": "google/gemini-2.5-pro-exp-03-25:free",           "label": "Gemini 2.5 Pro (free) · 1M ctx · best quality"},
-    {"id": "meta-llama/llama-4-maverick:free",               "label": "Llama 4 Maverick (free) · 1M ctx · strong all-rounder"},
-    {"id": "meta-llama/llama-4-scout:free",                  "label": "Llama 4 Scout (free) · 10M ctx · massive context"},
-    {"id": "deepseek/deepseek-r1:free",                      "label": "DeepSeek R1 (free) · 164K ctx · strong reasoning"},
-    {"id": "mistralai/mistral-small-3.1-24b-instruct:free",  "label": "Mistral Small 3.1 (free) · 128K ctx"},
-    {"id": "meta-llama/llama-3.3-70b-instruct:free",         "label": "Llama 3.3 70B (free) · 131K ctx · reliable"},
-    {"id": "anthropic/claude-sonnet-4-5",                    "label": "Claude Sonnet 4.5 (paid) · best quality"},
+    {"id": "openrouter/auto", "label": "OpenRouter Auto · picks best available free model"},
+    {"id": "google/gemini-2.5-pro-exp-03-25:free", "label": "Gemini 2.5 Pro (free) · 1M ctx · best quality"},
+    {"id": "meta-llama/llama-4-maverick:free", "label": "Llama 4 Maverick (free) · 1M ctx · strong all-rounder"},
+    {"id": "meta-llama/llama-4-scout:free", "label": "Llama 4 Scout (free) · 10M ctx · massive context"},
+    {"id": "deepseek/deepseek-r1:free", "label": "DeepSeek R1 (free) · 164K ctx · strong reasoning"},
+    {"id": "mistralai/mistral-small-3.1-24b-instruct:free", "label": "Mistral Small 3.1 (free) · 128K ctx"},
+    {"id": "meta-llama/llama-3.3-70b-instruct:free", "label": "Llama 3.3 70B (free) · 131K ctx · reliable"},
+    {"id": "anthropic/claude-sonnet-4-5", "label": "Claude Sonnet 4.5 (paid) · best quality"},
 ]
 
 
@@ -112,6 +109,7 @@ def set_model(model_id: str) -> None:
     # Reset client so it is rebuilt with the correct provider on next call
     _client = None
     logger.info(f"AI model switched to: {model_id}")
+
 
 MAX_HISTORY_TURNS = 20
 _UPCOMING_CACHE_TTL = 300  # seconds
@@ -259,7 +257,7 @@ class AgentBrain:
         """Bust the cache after a crawl or status change."""
         self._upcoming_cache = (0.0, [])
 
-    def build_context(self, query: str = "") -> str:
+    def build_context(self, query: str = "", course_name: Optional[str] = None) -> str:
         """Build the context block injected into every prompt."""
         parts: list[str] = []
 
@@ -277,8 +275,12 @@ class AgentBrain:
             parts.append("\n".join(lines))
 
         if query:
-            relevant_content = self.kb.search_course_content(query, n=3)
-            relevant_docs = self.kb.search_documents(query, n=4)
+            if course_name:
+                relevant_content = self.kb.search_course_content_by_course(query, course_name=course_name, n=3)
+                relevant_docs = self.kb.search_documents_by_course(query, course_name=course_name, n=4)
+            else:
+                relevant_content = self.kb.search_course_content(query, n=3)
+                relevant_docs = self.kb.search_documents(query, n=4)
 
             if relevant_content:
                 lines = ["\nRELEVANT COURSE CONTENT:"]
@@ -318,10 +320,10 @@ class AgentBrain:
     #  Chat                                                                #
     # ------------------------------------------------------------------ #
 
-    def chat(self, user_message: str) -> str:
+    def chat(self, user_message: str, course_name: Optional[str] = None) -> str:
         """Multi-turn conversation with the agent."""
         self.update_voice_profile()  # RF-VoiceDirty: no-op unless dirty
-        context = self.build_context(user_message)
+        context = self.build_context(user_message, course_name=course_name)
         system = SYSTEM_PROMPT + f"\n\n=== CURRENT CONTEXT ===\n{context}"
 
         self.conversation_history.append({"role": "user", "content": user_message})

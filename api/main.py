@@ -342,6 +342,8 @@ async def run_crawl_task() -> None:
     _save_status(crawl_status)
 
     try:
+        timed_out = False
+
         async with CanvasCrawler() as crawler:
             if not await crawler.verify_session():
                 crawl_status = {
@@ -361,6 +363,7 @@ async def run_crawl_task() -> None:
                     timeout=CRAWL_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
+                timed_out = True
                 logger.error(
                     f"Crawl timed out after {CRAWL_TIMEOUT_SECONDS // 3600}h. "
                     "Saving partial results."
@@ -377,7 +380,8 @@ async def run_crawl_task() -> None:
                 # Still save whatever was crawled before timeout
                 await crawler.save_knowledge()
 
-            await crawler.save_knowledge()
+            if not timed_out:
+                await crawler.save_knowledge()
 
         count = kb.ingest_knowledge()
         brain.invalidate_upcoming_cache()
@@ -453,7 +457,7 @@ async def get_briefing():
 @app.post("/api/knowledge/search")
 async def search_knowledge(body: ChatMessage):
     course = getattr(body, "course_name", None)
-    assignments = kb.search_assignments(body.message)
+    assignments = kb.search_assignments(body.message, course_name=course)
     content = kb.search_course_content_by_course(body.message, course_name=course)
     return {"assignments": assignments, "content": content}
 
@@ -470,7 +474,7 @@ async def chat(request: Request, body: ChatMessage):
     try:
         # RF-EventLoop: get_running_loop()
         reply = await asyncio.get_running_loop().run_in_executor(
-            None, partial(brain.chat, body.message)
+            None, partial(brain.chat, body.message, body.course_name)
         )
         return {"reply": reply, "timestamp": datetime.now().isoformat()}
     except Exception as e:
@@ -598,11 +602,15 @@ async def approve_assignment(body: AssignmentApproval):
 
     if body.approved:
         draft["status"] = "approved"
+        kb.update_assignment_status(draft["assignment_id"], "approved")
+        brain.invalidate_upcoming_cache()
         brain.log_event("approval", {"draft_id": body.assignment_id, "feedback": body.feedback})
         msg = "Assignment approved. Ready for submission."
     else:
         draft["status"] = "rejected"
         draft["feedback"] = body.feedback
+        kb.update_assignment_status(draft["assignment_id"], "rejected")
+        brain.invalidate_upcoming_cache()
         brain.log_event("rejection", {"draft_id": body.assignment_id, "feedback": body.feedback})
         msg = "Rejected. Provide feedback and regenerate."
 

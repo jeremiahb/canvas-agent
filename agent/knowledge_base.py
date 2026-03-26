@@ -465,16 +465,27 @@ class KnowledgeBase:
             logger.error(f"Error searching course content: {e}")
             return []
 
-
-        """Semantic search over assignment documents."""
+    def search_assignments(self, query: str, course_name: Optional[str] = None, n: int = 5) -> list:
+        """Semantic search over assignment documents, optionally scoped to one course."""
         count = self.assignments.count()
         if count == 0:
             return []
-        results = self.assignments.query(
-            query_texts=[query],
-            n_results=min(n, count),
-        )
-        return self._format_results(results)
+        try:
+            if course_name:
+                results = self.assignments.query(
+                    query_texts=[query],
+                    n_results=min(n, count),
+                    where={"course_name": course_name},
+                )
+            else:
+                results = self.assignments.query(
+                    query_texts=[query],
+                    n_results=min(n, count),
+                )
+            return self._format_results(results)
+        except Exception as e:
+            logger.error(f"Error searching assignments: {e}")
+            return []
 
     def search_course_content(self, query: str, n: int = 5) -> list:
         """Semantic search over syllabi, modules, announcements, and grades."""
@@ -544,7 +555,7 @@ class KnowledgeBase:
                 for i, doc in enumerate(results.get("documents", []))
             ]
         except Exception as e:
-            # Some ChromaDB versions don't support $ne on all backends —
+            # Some ChromaDB versions don't support $ne on all backends
             # fall back to Python-side filter rather than crashing
             logger.warning(f"ChromaDB where-filter failed, using Python filter: {e}")
             return [
