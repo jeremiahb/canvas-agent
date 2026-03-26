@@ -140,14 +140,15 @@ function SetupScreen({ onSave }) {
 // Nav
 // ------------------------------------------------------------------ //
 const NAV = [
-  { id: "dashboard",   label: "Dashboard"    },
-  { id: "chat",        label: "Chat"         },
-  { id: "assignments", label: "Assignments"  },
-  { id: "knowledge",   label: "Knowledge"    },
-  { id: "documents",   label: "Documents"    },
-  { id: "voice",       label: "Voice & Style"},
-  { id: "system",      label: "System"       },
-  { id: "snapshots",   label: "Snapshots"    },
+  { id: "dashboard",     label: "Dashboard"    },
+  { id: "chat",          label: "Chat"         },
+  { id: "assignments",   label: "Assignments"  },
+  { id: "knowledge",     label: "Knowledge"    },
+  { id: "knowledge-map", label: "Knowledge Map"},
+  { id: "documents",     label: "Documents"    },
+  { id: "voice",         label: "Voice & Style"},
+  { id: "system",        label: "System"       },
+  { id: "snapshots",     label: "Snapshots"    },
 ];
 
 // ------------------------------------------------------------------ //
@@ -971,6 +972,427 @@ const inputStyle = {
 };
 
 // ------------------------------------------------------------------ //
+// Knowledge Map panel — topics, concepts, notes, chat history
+// ------------------------------------------------------------------ //
+const NOTE_TYPE_LABELS = {
+  assignment_analysis: "Assignment",
+  document_summary: "Document",
+  course_content_summary: "Course Content",
+  grade_pattern: "Grade Pattern",
+};
+const NOTE_TYPE_COLORS = {
+  assignment_analysis: "#1d4ed8",
+  document_summary: "#059669",
+  course_content_summary: "#7c3aed",
+  grade_pattern: "#b45309",
+};
+
+function NoteTypeBadge({ noteType }) {
+  const label = NOTE_TYPE_LABELS[noteType] || noteType;
+  const color = NOTE_TYPE_COLORS[noteType] || "#374151";
+  return (
+    <span style={{
+      fontSize: 10, fontWeight: 600, padding: "2px 8px", borderRadius: 20,
+      background: color + "33", color, border: `1px solid ${color}55`,
+      letterSpacing: ".04em", textTransform: "uppercase",
+    }}>{label}</span>
+  );
+}
+
+function NoteCard({ note }) {
+  const [expanded, setExpanded] = useState(false);
+  const meta = note.metadata || {};
+  const text = note.document || "";
+  const preview = text.slice(0, 400);
+  const hasMore = text.length > 400;
+  return (
+    <div style={{ padding: "12px 16px", background: "#1f2937", borderRadius: 10, marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6, gap: 8 }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: "#f9fafb", marginBottom: 4 }}>
+            {meta.title || "Untitled"}
+          </div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+            <NoteTypeBadge noteType={meta.note_type} />
+            {meta.course_name && (
+              <span style={{ fontSize: 11, color: "#6b7280" }}>{meta.course_name}</span>
+            )}
+          </div>
+        </div>
+        {meta.generated_at && (
+          <div style={{ fontSize: 10, color: "#4b5563", flexShrink: 0 }}>
+            {new Date(meta.generated_at).toLocaleDateString()}
+          </div>
+        )}
+      </div>
+      <div style={{ fontSize: 12, color: "#9ca3af", lineHeight: 1.7, whiteSpace: "pre-wrap", marginTop: 8 }}>
+        {expanded ? text : preview}{hasMore && !expanded && "…"}
+      </div>
+      {hasMore && (
+        <button onClick={() => setExpanded(!expanded)}
+          style={{ fontSize: 11, color: "#3b82f6", background: "none", border: "none", cursor: "pointer", padding: "4px 0 0" }}>
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function TopicCard({ topic, onSelect, selected }) {
+  const meta = topic.metadata || {};
+  return (
+    <div onClick={() => onSelect(topic)} style={{
+      padding: "10px 14px", background: selected ? "#1d4ed822" : "#1f2937",
+      borderRadius: 10, marginBottom: 6, cursor: "pointer",
+      border: selected ? "1px solid #1d4ed855" : "1px solid transparent",
+      transition: "all 0.1s",
+    }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: "#f9fafb" }}>
+        {meta.topic_name || "Topic"}
+      </div>
+      <div style={{ fontSize: 11, color: "#6b7280", marginTop: 2 }}>
+        {meta.course_name || ""}
+        {meta.note_count ? ` · ${meta.note_count} notes` : ""}
+      </div>
+      {meta.summary && (
+        <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4, lineHeight: 1.5 }}>
+          {meta.summary.slice(0, 120)}{meta.summary.length > 120 ? "…" : ""}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function KnowledgeMapPanel({ api }) {
+  const [mapTab, setMapTab] = useState("notes");
+  const [courses, setCourses] = useState([]);
+  const [selectedCourse, setSelectedCourse] = useState("");
+  const [noteType, setNoteType] = useState("");
+  const [stats, setStats] = useState(null);
+  const [notes, setNotes] = useState([]);
+  const [topics, setTopics] = useState([]);
+  const [selectedTopic, setSelectedTopic] = useState(null);
+  const [topicConcepts, setTopicConcepts] = useState([]);
+  const [conceptQuery, setConceptQuery] = useState("");
+  const [conceptResults, setConceptResults] = useState([]);
+  const [chatHistory, setChatHistory] = useState([]);
+  const [noteQuery, setNoteQuery] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [genMsg, setGenMsg] = useState("");
+  const [loadingNotes, setLoadingNotes] = useState(false);
+  const [loadingTopics, setLoadingTopics] = useState(false);
+
+  useEffect(() => {
+    api.get("/knowledge/courses").then((r) => setCourses(r.courses || [])).catch(() => {});
+    api.get("/notes/stats").then(setStats).catch(() => {});
+  }, [api]);
+
+  // Load notes when tab/filter changes
+  useEffect(() => {
+    if (mapTab !== "notes") return;
+    setLoadingNotes(true);
+    const params = new URLSearchParams();
+    if (selectedCourse) params.set("course_name", selectedCourse);
+    if (noteType) params.set("note_type", noteType);
+    api.get(`/notes/list?${params}`)
+      .then((r) => setNotes(r.notes || []))
+      .catch(() => setNotes([]))
+      .finally(() => setLoadingNotes(false));
+  }, [api, mapTab, selectedCourse, noteType]);
+
+  // Load topics when tab changes
+  useEffect(() => {
+    if (mapTab !== "topics") return;
+    setLoadingTopics(true);
+    const params = selectedCourse ? `?course_name=${encodeURIComponent(selectedCourse)}` : "";
+    api.get(`/topics/list${params}`)
+      .then((r) => setTopics(r.topics || []))
+      .catch(() => setTopics([]))
+      .finally(() => setLoadingTopics(false));
+  }, [api, mapTab, selectedCourse]);
+
+  // Load concepts when topic is selected
+  useEffect(() => {
+    if (!selectedTopic) { setTopicConcepts([]); return; }
+    api.get(`/topics/${encodeURIComponent(selectedTopic.id)}/concepts`)
+      .then((r) => setTopicConcepts(r.concepts || []))
+      .catch(() => setTopicConcepts([]));
+  }, [api, selectedTopic]);
+
+  // Load chat history
+  useEffect(() => {
+    if (mapTab !== "history") return;
+    api.get("/chat/history?n=80")
+      .then((r) => setChatHistory(r.history || []))
+      .catch(() => setChatHistory([]));
+  }, [api, mapTab]);
+
+  const searchNotes = async () => {
+    if (!noteQuery.trim()) return;
+    setSearching(true);
+    try {
+      const res = await api.post("/notes/search", {
+        message: noteQuery, course_name: selectedCourse || undefined,
+      });
+      setNotes(res.results || []);
+    } catch {
+      setNotes([]);
+    }
+    setSearching(false);
+  };
+
+  const searchConcepts = async () => {
+    if (!conceptQuery.trim()) return;
+    const params = new URLSearchParams({ query: conceptQuery });
+    if (selectedCourse) params.set("course_name", selectedCourse);
+    try {
+      const res = await api.get(`/concepts/search?${params}`);
+      setConceptResults(res.results || []);
+    } catch {
+      setConceptResults([]);
+    }
+  };
+
+  const triggerGenerate = async () => {
+    setGenerating(true);
+    setGenMsg("");
+    try {
+      const res = await api.post("/notes/generate", {});
+      setGenMsg(res.message || "Pipeline started.");
+    } catch {
+      setGenMsg("Error starting pipeline.");
+    }
+    setGenerating(false);
+  };
+
+  // Group chat history by session date
+  const historyByDate = chatHistory.reduce((acc, msg) => {
+    const date = msg.metadata?.session_date || "Unknown";
+    if (!acc[date]) acc[date] = [];
+    acc[date].push(msg);
+    return acc;
+  }, {});
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+      {/* Stats */}
+      {stats && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+          {[
+            ["Notes", stats.total_notes],
+            ["Topics", stats.total_topics],
+            ["Concepts", stats.total_concepts],
+            ["Chat History", stats.chat_history_entries],
+          ].map(([label, val]) => (
+            <div key={label} style={{ padding: "12px 16px", background: "#1f2937", borderRadius: 10 }}>
+              <div style={{ fontSize: 22, fontWeight: 700, color: "#f9fafb" }}>{val ?? "—"}</div>
+              <div style={{ fontSize: 11, color: "#6b7280", marginTop: 2 }}>{label}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Controls row */}
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <select value={selectedCourse}
+          onChange={(e) => { setSelectedCourse(e.target.value); setSelectedTopic(null); setNotes([]); setTopics([]); }}
+          style={{ padding: "8px 12px", background: "#1f2937", border: "1px solid #374151",
+            borderRadius: 8, color: "#f9fafb", fontSize: 13, fontFamily: "inherit" }}>
+          <option value="">All Courses</option>
+          {courses.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+        <div style={{ flex: 1 }} />
+        {genMsg && <span style={{ fontSize: 12, color: "#22c55e" }}>{genMsg}</span>}
+        <Btn onClick={triggerGenerate} disabled={generating} small>
+          {generating ? "Running…" : "Organize Now"}
+        </Btn>
+      </div>
+
+      {/* Tab bar */}
+      <div style={{ display: "flex", gap: 4 }}>
+        {[
+          { id: "notes",   label: "Study Notes" },
+          { id: "topics",  label: "Topic Map"   },
+          { id: "concepts",label: "Concepts"    },
+          { id: "history", label: "Chat History"},
+        ].map((t) => (
+          <button key={t.id} onClick={() => setMapTab(t.id)} style={{
+            padding: "6px 16px", borderRadius: 20, border: "none", cursor: "pointer",
+            background: mapTab === t.id ? "#1d4ed8" : "#1f2937", color: "#f9fafb",
+            fontSize: 13, fontFamily: "inherit", fontWeight: mapTab === t.id ? 600 : 400,
+          }}>{t.label}</button>
+        ))}
+      </div>
+
+      {/* --- Notes tab --- */}
+      {mapTab === "notes" && (
+        <div>
+          {/* Note type filter */}
+          <div style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
+            {[["", "All Types"], ["assignment_analysis", "Assignments"], ["document_summary", "Documents"],
+              ["grade_pattern", "Grade Patterns"]].map(([val, label]) => (
+              <button key={val} onClick={() => setNoteType(val)} style={{
+                padding: "4px 12px", borderRadius: 20, border: "none", cursor: "pointer",
+                background: noteType === val ? "#374151" : "#1f2937",
+                color: noteType === val ? "#f9fafb" : "#6b7280",
+                fontSize: 12, fontFamily: "inherit",
+              }}>{label}</button>
+            ))}
+          </div>
+          {/* Search */}
+          <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+            <input value={noteQuery} onChange={(e) => setNoteQuery(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && searchNotes()}
+              placeholder="Search notes…"
+              style={{ ...inputStyle, flex: 1 }} />
+            <Btn onClick={searchNotes} disabled={searching || !noteQuery.trim()} small>
+              {searching ? "…" : "Search"}
+            </Btn>
+          </div>
+          {loadingNotes && <div style={{ fontSize: 13, color: "#6b7280", textAlign: "center", padding: 20 }}>Loading…</div>}
+          {!loadingNotes && notes.length === 0 && (
+            <EmptyState label={stats?.total_notes === 0
+              ? "No notes yet. Run a crawl or upload documents, then click 'Organize Now'."
+              : "No notes match the current filter."} />
+          )}
+          {notes.map((n) => <NoteCard key={n.id} note={n} />)}
+        </div>
+      )}
+
+      {/* --- Topics tab --- */}
+      {mapTab === "topics" && (
+        <div style={{ display: "grid", gridTemplateColumns: selectedTopic ? "1fr 1.4fr" : "1fr", gap: 16 }}>
+          {/* Topic list */}
+          <div>
+            {loadingTopics && <div style={{ fontSize: 13, color: "#6b7280", padding: 20, textAlign: "center" }}>Loading…</div>}
+            {!loadingTopics && topics.length === 0 && (
+              <EmptyState label="No topics yet. Run a crawl then click 'Organize Now' to build the topic map." />
+            )}
+            {topics.map((t) => (
+              <TopicCard key={t.id} topic={t}
+                selected={selectedTopic?.id === t.id}
+                onSelect={setSelectedTopic} />
+            ))}
+          </div>
+          {/* Topic detail */}
+          {selectedTopic && (
+            <div style={{ padding: "16px 20px", background: "#1f2937", borderRadius: 12, overflowY: "auto", maxHeight: "70vh" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
+                <div>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: "#f9fafb" }}>
+                    {selectedTopic.metadata?.topic_name}
+                  </div>
+                  <div style={{ fontSize: 12, color: "#6b7280", marginTop: 2 }}>
+                    {selectedTopic.metadata?.course_name}
+                  </div>
+                </div>
+                <button onClick={() => setSelectedTopic(null)}
+                  style={{ background: "none", border: "none", color: "#6b7280", cursor: "pointer", fontSize: 18 }}>×</button>
+              </div>
+              {topicConcepts.length > 0 && (
+                <div style={{ marginBottom: 14 }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", textTransform: "uppercase",
+                    letterSpacing: ".07em", marginBottom: 8 }}>Key Concepts</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {topicConcepts.map((c) => (
+                      <span key={c.id} title={c.document} style={{
+                        fontSize: 11, padding: "3px 10px", borderRadius: 20,
+                        background: "#111827", border: "1px solid #374151", color: "#d1d5db",
+                        cursor: "default",
+                      }}>
+                        {c.metadata?.concept_name || c.document?.split(":")[0]}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div style={{ fontSize: 12, color: "#d1d5db", lineHeight: 1.8, whiteSpace: "pre-wrap" }}>
+                {selectedTopic.document}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* --- Concepts tab --- */}
+      {mapTab === "concepts" && (
+        <div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+            <input value={conceptQuery} onChange={(e) => setConceptQuery(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && searchConcepts()}
+              placeholder="Search concepts…"
+              style={{ ...inputStyle, flex: 1 }} />
+            <Btn onClick={searchConcepts} disabled={!conceptQuery.trim()} small>Search</Btn>
+          </div>
+          {conceptResults.length === 0 && (
+            <EmptyState label="Search for a concept to see definitions and related topics." />
+          )}
+          {conceptResults.map((c, i) => {
+            const meta = c.metadata || {};
+            const [name, ...defParts] = (c.document || "").split(": ");
+            return (
+              <div key={i} style={{ padding: "12px 16px", background: "#1f2937", borderRadius: 10, marginBottom: 8 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "#f9fafb" }}>{name}</div>
+                  {meta.importance && (
+                    <span style={{ fontSize: 10, color: "#6b7280" }}>Importance: {meta.importance}/5</span>
+                  )}
+                </div>
+                <div style={{ fontSize: 12, color: "#9ca3af", marginTop: 4 }}>{defParts.join(": ")}</div>
+                <div style={{ fontSize: 11, color: "#4b5563", marginTop: 6 }}>
+                  {meta.topic_name && `Topic: ${meta.topic_name}`}
+                  {meta.course_name && ` · ${meta.course_name}`}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* --- Chat History tab --- */}
+      {mapTab === "history" && (
+        <div>
+          {chatHistory.length === 0 && (
+            <EmptyState label="No chat history yet. Chat with the agent to build up a conversation history." />
+          )}
+          {Object.entries(historyByDate)
+            .sort(([a], [b]) => b.localeCompare(a))
+            .map(([date, msgs]) => (
+            <div key={date} style={{ marginBottom: 24 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", textTransform: "uppercase",
+                letterSpacing: ".07em", marginBottom: 10 }}>{date}</div>
+              {msgs.map((msg) => {
+                const isUser = msg.metadata?.role === "user";
+                return (
+                  <div key={msg.id} style={{
+                    display: "flex", justifyContent: isUser ? "flex-end" : "flex-start",
+                    marginBottom: 8,
+                  }}>
+                    <div style={{
+                      maxWidth: "80%", padding: "10px 14px", borderRadius: 12,
+                      background: isUser ? "#1d4ed8" : "#1f2937",
+                      fontSize: 12, color: "#f9fafb", lineHeight: 1.6, whiteSpace: "pre-wrap",
+                    }}>
+                      <div style={{ fontSize: 10, color: isUser ? "#93c5fd" : "#6b7280", marginBottom: 4 }}>
+                        {isUser ? "You" : "Agent"}
+                        {msg.metadata?.course_name ? ` · ${msg.metadata.course_name}` : ""}
+                      </div>
+                      {msg.content?.slice(0, 500)}{msg.content?.length > 500 ? "…" : ""}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ //
 // Voice panel
 // ------------------------------------------------------------------ //
 function VoicePanel({ api }) {
@@ -1306,14 +1728,15 @@ export default function App() {
   }
 
   const panels = {
-    dashboard:   <DashboardPanel   api={api} />,
-    chat:        <ChatPanel        api={api} />,
-    assignments: <AssignmentsPanel api={api} />,
-    knowledge:   <KnowledgePanel   api={api} />,
-    documents:   <DocumentsPanel   api={api} />,
-    voice:       <VoicePanel       api={api} />,
-    system:      <SystemPanel      api={api} onSignOut={signOut} />,
-    snapshots:   <SnapshotsPanel   api={api} />,
+    dashboard:       <DashboardPanel      api={api} />,
+    chat:            <ChatPanel           api={api} />,
+    assignments:     <AssignmentsPanel    api={api} />,
+    knowledge:       <KnowledgePanel      api={api} />,
+    "knowledge-map": <KnowledgeMapPanel   api={api} />,
+    documents:       <DocumentsPanel      api={api} />,
+    voice:           <VoicePanel          api={api} />,
+    system:          <SystemPanel         api={api} onSignOut={signOut} />,
+    snapshots:       <SnapshotsPanel      api={api} />,
   };
 
   return (

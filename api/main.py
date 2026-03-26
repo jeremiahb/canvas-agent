@@ -47,6 +47,7 @@ from agent.crawler import CanvasCrawler
 from agent.document_ingester import extract_text_from_bytes  # RF-InlineImport
 from agent.file_generator import generate_file
 from agent.knowledge_base import KnowledgeBase
+from agent.knowledge_organizer import KnowledgeOrganizer, TOPIC_MAP_PATH
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -169,6 +170,8 @@ def _json_401():
 
 kb = KnowledgeBase()
 brain = AgentBrain(kb)
+organizer = KnowledgeOrganizer(kb)
+_pipeline_task = None  # module-level ref prevents GC of fire-and-forget tasks
 
 
 def _atomic_write(path: Path, data: str) -> None:
@@ -411,10 +414,14 @@ async def run_crawl_task() -> None:
             crawl_status = {
                 "running": False,
                 "last_run": datetime.now().isoformat(),
-                "message": f"Crawl complete -- {count} documents indexed",
+                "message": f"Crawl complete -- {count} documents indexed. Knowledge pipeline running in background.",
                 "stats": kb.stats(),
             }
-            logger.info("Crawl complete")
+            logger.info("Crawl complete — launching knowledge pipeline")
+
+            # Fire-and-forget: generate notes + organize knowledge after every crawl
+            global _pipeline_task
+            _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
 
     except Exception as e:
         logger.error(f"Crawl error: {e}", exc_info=True)
@@ -695,6 +702,8 @@ async def upload_document_text(body: ManualDocument):
     )
     logger.debug(f"[POST /api/documents/upload] Stored with id={doc_id!r}")
     brain.invalidate_upcoming_cache()
+    global _pipeline_task
+    _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
     return {
         "message": f"Document '{body.title}' added to knowledge base",
         "doc_id": doc_id,
@@ -739,6 +748,8 @@ async def upload_document_file(
     )
     logger.debug(f"[POST /api/documents/upload-file] Stored with id={doc_id!r}")
     brain.invalidate_upcoming_cache()
+    global _pipeline_task
+    _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
     return {
         "message": f"'{doc_title}' ingested ({len(text):,} characters extracted)",
         "doc_id": doc_id,
@@ -759,6 +770,116 @@ async def search_documents(body: ChatMessage):
     course = getattr(body, "course_name", None)
     results = kb.search_documents_by_course(body.message, course_name=course, n=8)
     return {"results": results}
+
+
+# ------------------------------------------------------------------ #
+#  AI Notes                                                            #
+# ------------------------------------------------------------------ #
+
+
+@app.get("/api/notes/list")
+async def list_notes(course_name: Optional[str] = None, note_type: Optional[str] = None):
+    """List all AI-generated study notes, optionally filtered by course or note_type."""
+    notes = kb.get_all_notes(course_name=course_name, note_type=note_type)
+    return {"notes": notes, "total": len(notes)}
+
+
+@app.post("/api/notes/search")
+async def search_notes(body: ChatMessage):
+    """Semantic search over AI-generated study notes."""
+    course = getattr(body, "course_name", None)
+    results = kb.search_ai_notes(body.message, course_name=course, n=20)
+    return {"results": results}
+
+
+@app.post("/api/notes/generate")
+async def trigger_note_generation(background_tasks: BackgroundTasks):
+    """Manually trigger the full knowledge pipeline for all unprocessed documents."""
+    background_tasks.add_task(organizer.run_full_pipeline)
+    return {"message": "Knowledge pipeline started in background"}
+
+
+@app.get("/api/notes/stats")
+async def notes_stats():
+    """Return counts for the knowledge learning system."""
+    from agent.knowledge_organizer import _load_processed_ids
+    processed_ids = _load_processed_ids()
+    return {
+        "total_notes": kb.ai_notes.count(),
+        "total_topics": kb.topics.count(),
+        "total_concepts": kb.concepts.count(),
+        "chat_history_entries": kb.chat_history.count(),
+        "processed_source_docs": len(processed_ids),
+        "total_assignments": kb.assignments.count(),
+        "total_documents": kb.documents.count(),
+    }
+
+
+# ------------------------------------------------------------------ #
+#  Topics                                                              #
+# ------------------------------------------------------------------ #
+
+
+@app.get("/api/topics/list")
+async def list_topics(course_name: Optional[str] = None):
+    """List all synthesized topic overviews, optionally filtered by course."""
+    topics = kb.get_all_topics(course_name=course_name)
+    return {"topics": topics, "total": len(topics)}
+
+
+@app.post("/api/topics/search")
+async def search_topics(body: ChatMessage):
+    """Semantic search over synthesized topic overviews."""
+    course = getattr(body, "course_name", None)
+    results = kb.search_topics(body.message, course_name=course, n=10)
+    return {"results": results}
+
+
+@app.get("/api/topics/{topic_id}/concepts")
+async def get_topic_concepts(topic_id: str):
+    """Get all concepts extracted for a specific topic."""
+    concepts = kb.get_concepts_for_topic(topic_id)
+    return {"concepts": concepts, "total": len(concepts)}
+
+
+# ------------------------------------------------------------------ #
+#  Concepts                                                            #
+# ------------------------------------------------------------------ #
+
+
+@app.get("/api/concepts/search")
+async def search_concepts(query: str, course_name: Optional[str] = None):
+    """Semantic search over extracted concept definitions."""
+    results = kb.search_concepts(query, course_name=course_name, n=12)
+    return {"results": results}
+
+
+# ------------------------------------------------------------------ #
+#  Knowledge map                                                       #
+# ------------------------------------------------------------------ #
+
+
+@app.get("/api/knowledge/topic-map")
+async def get_topic_map():
+    """Return the full hierarchical topic map JSON."""
+    if TOPIC_MAP_PATH.exists():
+        try:
+            return json.loads(TOPIC_MAP_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"generated_at": None, "courses": {}}
+
+
+# ------------------------------------------------------------------ #
+#  Chat history                                                        #
+# ------------------------------------------------------------------ #
+
+
+@app.get("/api/chat/history")
+async def get_chat_history(n: int = 60):
+    """Return the n most recent persisted chat messages, newest first."""
+    history = kb.get_recent_chat_history(n=n)
+    return {"history": history, "total": len(history)}
 
 
 # ------------------------------------------------------------------ #

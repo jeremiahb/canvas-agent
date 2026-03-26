@@ -23,6 +23,8 @@ import json
 import logging
 import os
 import time
+import uuid
+from datetime import datetime
 from typing import Optional
 
 from anthropic import Anthropic
@@ -451,6 +453,36 @@ class AgentBrain:
                     lines.append(r["document"][:800])
                 parts.append("\n".join(lines))
 
+            # Inject organized knowledge (topics + concepts) if available
+            try:
+                if self.kb.topics.count() > 0:
+                    topic_hits = self.kb.search_topics(query, course_name=course_name, n=2)
+                    if topic_hits:
+                        lines = ["\nTOPIC KNOWLEDGE (from study notes):"]
+                        for t in topic_hits:
+                            lines.append(f"[{t['metadata'].get('topic_name', '')}]")
+                            lines.append(t["document"][:700])
+                        parts.append("\n".join(lines))
+
+                if self.kb.concepts.count() > 0:
+                    concept_hits = self.kb.search_concepts(query, course_name=course_name, n=5)
+                    if concept_hits:
+                        lines = ["\nRELEVANT CONCEPTS:"]
+                        for c in concept_hits:
+                            lines.append(f"  • {c['document']}")
+                        parts.append("\n".join(lines))
+
+                if self.kb.ai_notes.count() > 0:
+                    note_hits = self.kb.search_ai_notes(query, course_name=course_name, n=2)
+                    if note_hits:
+                        lines = ["\nSTUDY NOTES ON RELATED CONTENT:"]
+                        for n in note_hits:
+                            lines.append(f"[{n['metadata'].get('title', '')}]")
+                            lines.append(n["document"][:600])
+                        parts.append("\n".join(lines))
+            except Exception:
+                pass  # never let knowledge injection break chat
+
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------------ #
@@ -474,6 +506,18 @@ class AgentBrain:
     #  Chat                                                                #
     # ------------------------------------------------------------------ #
 
+    def persist_chat_message(self, role: str, content: str, course_name: str = "") -> None:
+        """Permanently save a chat turn to ChromaDB chat_history collection."""
+        msg_id = f"chat_{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{uuid.uuid4().hex[:8]}"
+        try:
+            self.kb.save_chat_message(msg_id, role, content, {
+                "timestamp": datetime.now().isoformat(),
+                "course_name": course_name or "",
+                "session_date": datetime.now().date().isoformat(),
+            })
+        except Exception as e:
+            logger.warning(f"Failed to persist chat message: {e}")
+
     def chat(self, user_message: str, course_name: Optional[str] = None) -> str:
         """Multi-turn conversation with the agent."""
         logger.debug(f"[chat] user_message={user_message[:80]!r} course={course_name!r} history_len={len(self.conversation_history)}")
@@ -486,6 +530,9 @@ class AgentBrain:
         self._trim_history()
         logger.debug(f"[chat] History after trim: {len(self.conversation_history)} messages — calling AI")
 
+        # Persist user turn permanently
+        self.persist_chat_message("user", user_message, course_name=course_name or "")
+
         response = _call_api(  # RF-LazyClient, RF-ModelConst
             system=system,
             messages=self.conversation_history,
@@ -495,6 +542,10 @@ class AgentBrain:
         reply = _extract_text(response)  # RF-ContentIdx
         logger.debug(f"[chat] AI reply: {len(reply)} chars")
         self.conversation_history.append({"role": "assistant", "content": reply})
+
+        # Persist assistant reply permanently
+        self.persist_chat_message("assistant", reply, course_name=course_name or "")
+
         return reply
 
     def reset_conversation(self) -> None:
