@@ -218,7 +218,39 @@ class CanvasCrawler:
             except Exception as e:
                 logger.warning(f"Error parsing course card: {e}", exc_info=True)
 
+        if not courses:
+            logger.warning("No dashboard cards found — falling back to Canvas REST API")
+            courses = await self._get_courses_via_api()
+
         return courses
+
+    async def _get_courses_via_api(self) -> list:
+        """Fallback: fetch enrolled courses via Canvas REST API using session cookies."""
+        url = (
+            f"{self.base_url}/api/v1/courses"
+            "?enrollment_type=student&enrollment_state=active&per_page=100"
+        )
+        try:
+            response = await self.page.context.request.get(url)
+            if not response.ok:
+                logger.error(f"Canvas API returned {response.status} for courses")
+                return []
+            data = await response.json()
+            courses = []
+            for c in data:
+                if not isinstance(c, dict) or "id" not in c:
+                    continue
+                courses.append({
+                    "id": str(c["id"]),
+                    "name": c.get("name", "Unknown").strip(),
+                    "code": c.get("course_code", "").strip(),
+                    "url": c.get("html_url", f"{self.base_url}/courses/{c['id']}"),
+                })
+                logger.info(f"[COURSE-API] {c.get('name')} (id={c['id']})")
+            return courses
+        except Exception as e:
+            logger.error(f"Canvas REST API course fetch failed: {e}", exc_info=True)
+            return []
 
     # ------------------------------------------------------------------ #
     #  Assignments                                                         #
