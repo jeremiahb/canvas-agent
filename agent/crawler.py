@@ -35,6 +35,19 @@ _MAX_DELAY = 1.8
 # Course name fragments to skip — admin/orientation courses with no real assignments
 _SKIP_COURSE_FRAGMENTS = ["BrushUp", "Student Assistance", "Orientation", "Tutorial"]
 
+# A real enrolled course always has a 5-digit CRN in its name or code,
+# e.g. "Appl Concepts in Acct and Fin (20345.B2)" or "FIN300.20345.B2.Online"
+_CRN_RE = re.compile(r"\b\d{5}\b")
+
+
+def _is_real_course(course: dict) -> bool:
+    """Return True only for genuine enrolled courses that carry a CRN."""
+    name = course.get("name", "")
+    code = course.get("code", "")
+    if any(f.lower() in name.lower() for f in _SKIP_COURSE_FRAGMENTS):
+        return False
+    return bool(_CRN_RE.search(name) or _CRN_RE.search(code))
+
 
 async def _polite_goto(page: Page, url: str) -> None:
     """
@@ -349,7 +362,9 @@ class CanvasCrawler:
         announcements = []
         for item in await self.page.query_selector_all(".ic-announcement-row"):
             try:
-                title_el = await item.query_selector(".ic-announcement-row__content-title")
+                # Actual Canvas HTML uses a.ic-item-row__content-link for the title —
+                # .ic-announcement-row__content-title does not exist in the rendered DOM.
+                title_el = await item.query_selector("a.ic-item-row__content-link")
                 date_el = await item.query_selector("time")
                 title = (await title_el.inner_text()).strip() if title_el else ""
                 if title:
@@ -413,15 +428,20 @@ class CanvasCrawler:
         for row in await self.page.query_selector_all("tr.student_assignment"):
             try:
                 title_el = await row.query_selector(".title a")
-                score_el = await row.query_selector(".score")
-                possible_el = await row.query_selector(".possible")
+                # Actual Canvas HTML: score is inside td.assignment_score > span.grade;
+                # points possible is the following span (text like "/ 100");
+                # due date is td.due.  (.score and .possible do not exist.)
+                score_el = await row.query_selector(".assignment_score .grade")
+                possible_el = await row.query_selector(".assignment_score span:nth-child(2)")
+                due_el = await row.query_selector("td.due")
 
                 title = (await title_el.inner_text()).strip() if title_el else ""
                 if title:
                     grades.append({
                         "assignment": title,
                         "score": (await score_el.inner_text()).strip() if score_el else "-",
-                        "possible": (await possible_el.inner_text()).strip() if possible_el else "-",
+                        "possible": (await possible_el.inner_text()).strip().lstrip("/ ") if possible_el else "-",
+                        "due": (await due_el.inner_text()).strip() if due_el else "",
                     })
             except Exception as e:
                 logger.warning(f"Error parsing grade row: {e}", exc_info=True)
@@ -483,9 +503,9 @@ class CanvasCrawler:
             cid = course["id"]
             slug = re.sub(r"[^\w]", "_", course["name"])[:30]
 
-            # Skip admin/orientation courses — no real assignments
-            if any(f.lower() in course["name"].lower() for f in _SKIP_COURSE_FRAGMENTS):
-                logger.info(f"[SKIP] {course['name']} — non-academic course")
+            # Only crawl real enrolled courses — must contain a 5-digit CRN
+            if not _is_real_course(course):
+                logger.info(f"[SKIP] {course['name']} — no CRN, not an enrolled course")
                 continue
 
             logger.info(f"[CRAWL] {course['name']}")

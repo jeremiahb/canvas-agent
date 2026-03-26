@@ -343,6 +343,8 @@ function AssignmentsPanel({ api }) {
   const [queue, setQueue] = useState([]);
   const [selected, setSelected] = useState(null);
   const [analysis, setAnalysis] = useState(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState(null);
   const [generating, setGenerating] = useState(false);
   const [tab, setTab] = useState("upcoming");
 
@@ -356,9 +358,17 @@ function AssignmentsPanel({ api }) {
   const analyze = async (a) => {
     setSelected(a);
     setAnalysis(null);
+    setAnalyzeError(null);
+    setAnalyzing(true);
     const id = a.metadata?.assignment_id;
-    const res = await api.post(`/assignments/analyze/${encodeURIComponent(id)}`, {});
-    setAnalysis(res.analysis);
+    try {
+      const res = await api.post(`/assignments/analyze/${encodeURIComponent(id)}`, {});
+      setAnalysis(res.analysis);
+    } catch (err) {
+      setAnalyzeError(err?.message || "Analysis failed. Check the server logs.");
+    } finally {
+      setAnalyzing(false);
+    }
   };
 
   const generate = async (a) => {
@@ -427,7 +437,9 @@ function AssignmentsPanel({ api }) {
                       </div>
                     </div>
                     <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-                      <Btn small onClick={() => analyze(a)}>Analyze</Btn>
+                      <Btn small onClick={() => analyze(a)} disabled={analyzing}>
+                        {analyzing && selected?.metadata?.assignment_id === a.metadata?.assignment_id ? "Analyzing…" : "Analyze"}
+                      </Btn>
                       <Btn small onClick={() => generate(a)} disabled={generating}>Generate</Btn>
                     </div>
                   </div>
@@ -467,6 +479,27 @@ function AssignmentsPanel({ api }) {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {analyzing && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+          <div style={{ background: "#111827", borderRadius: 16, padding: 28, color: "#f9fafb", fontSize: 15 }}>
+            Analyzing assignment…
+          </div>
+        </div>
+      )}
+
+      {selected && analyzeError && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+          <div style={{ background: "#111827", borderRadius: 16, padding: 28, maxWidth: 500, width: "90%" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
+              <h3 style={{ margin: 0, fontSize: 15, color: "#f87171" }}>Analysis failed</h3>
+              <button onClick={() => { setSelected(null); setAnalyzeError(null); }}
+                style={{ background: "none", border: "none", color: "#6b7280", cursor: "pointer", fontSize: 18 }}>x</button>
+            </div>
+            <p style={{ color: "#d1d5db", fontSize: 13, margin: 0 }}>{analyzeError}</p>
+          </div>
         </div>
       )}
 

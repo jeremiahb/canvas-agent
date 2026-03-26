@@ -61,6 +61,14 @@ MICROSOFT_HOSTS   = {"onedrive.live.com", "sharepoint.com", "1drv.ms"}
 # Hard cap on individual file downloads to protect against OOM
 MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
 
+# Domains whose URLs appear as module items but contain no course-specific content
+# (generic Canvas help pages, university support portals, etc.)
+_SKIP_MODULE_DOMAINS = {
+    "community.instructure.com",
+    "community.canvaslms.com",
+    "wilmu.edu",  # general university links, not course material
+}
+
 
 def classify_url(url: str) -> str:
     """
@@ -346,6 +354,12 @@ class DocumentIngester:
                 if self.base_url in full_url and not any(
                     k in full_url for k in ["/files/", "/download", "/pages/", "/external"]
                 ):
+                    continue
+
+                # Skip generic help/support domains — not course-specific content
+                parsed_host = urlparse(full_url).netloc.replace("www.", "")
+                if any(d in parsed_host for d in _SKIP_MODULE_DOMAINS):
+                    logger.debug(f"Skipping noise domain: {full_url}")
                     continue
 
                 await self._process_url(full_url, title, course_name, source="module")

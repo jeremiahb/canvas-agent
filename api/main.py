@@ -28,9 +28,13 @@ from functools import partial
 from pathlib import Path
 from typing import Optional
 
+import re
+
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -81,7 +85,24 @@ limiter = Limiter(key_func=get_remote_address)
 #  App                                                                 #
 # ------------------------------------------------------------------ #
 
-app = FastAPI(title="Canvas AI Student Agent", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run startup checks when the app starts."""
+    if not _API_SECRET:
+        logger.error(
+            "=" * 70 + "\n"
+            "SECURITY WARNING: API_SECRET environment variable is not set.\n"
+            "All /api/* routes are publicly accessible to anyone who knows\n"
+            "your Railway URL. Set API_SECRET in Railway Variables NOW.\n"
+            "Generate a strong secret with: python -c \"import secrets; print(secrets.token_hex(32))\"\n"
+            + "=" * 70
+        )
+    else:
+        logger.info("API_SECRET is set. Authentication middleware active.")
+    yield
+
+
+app = FastAPI(title="Canvas AI Student Agent", version="1.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -102,26 +123,6 @@ app.add_middleware(
 
 _API_SECRET = os.environ.get("API_SECRET", "").strip()
 
-
-@app.on_event("startup")
-async def _startup_checks() -> None:
-    """
-    RF-AuthStartup: run security and configuration checks at startup so
-    misconfigurations are logged immediately rather than discovered later.
-    A missing API_SECRET means every /api/* route is publicly accessible —
-    this must never be silent on a live Railway deployment.
-    """
-    if not _API_SECRET:
-        logger.error(
-            "=" * 70 + "\n"
-            "SECURITY WARNING: API_SECRET environment variable is not set.\n"
-            "All /api/* routes are publicly accessible to anyone who knows\n"
-            "your Railway URL. Set API_SECRET in Railway Variables NOW.\n"
-            "Generate a strong secret with: python -c \"import secrets; print(secrets.token_hex(32))\"\n"
-            + "=" * 70
-        )
-    else:
-        logger.info("API_SECRET is set. Authentication middleware active.")
 
 
 @app.middleware("http")
@@ -147,7 +148,6 @@ async def require_auth(request: Request, call_next):
 
 
 def _json_401():
-    from fastapi.responses import JSONResponse
     return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
 
@@ -386,13 +386,14 @@ async def run_crawl_task() -> None:
         count = kb.ingest_knowledge()
         brain.invalidate_upcoming_cache()
 
-        crawl_status = {
-            "running": False,
-            "last_run": datetime.now().isoformat(),
-            "message": f"Crawl complete -- {count} documents indexed",
-            "stats": kb.stats(),
-        }
-        logger.info("Crawl complete")
+        if not timed_out:
+            crawl_status = {
+                "running": False,
+                "last_run": datetime.now().isoformat(),
+                "message": f"Crawl complete -- {count} documents indexed",
+                "stats": kb.stats(),
+            }
+            logger.info("Crawl complete")
 
     except Exception as e:
         logger.error(f"Crawl error: {e}", exc_info=True)
@@ -814,14 +815,12 @@ async def list_snapshots():
 async def get_snapshot(name: str):
     """Serve a specific HTML snapshot file."""
     # Sanitize — only allow safe filename characters
-    import re as _re
-    safe = _re.sub(r"[^\w\-]", "", name)
+    safe = re.sub(r"[^\w\-]", "", name)
     snap_path = (DATA_DIR / "debug_snapshots" / f"{safe}.html").resolve()
     if not str(snap_path).startswith(str(DATA_DIR)):
         raise HTTPException(403, "Access denied")
     if not snap_path.exists():
         raise HTTPException(404, "Snapshot not found")
-    from fastapi.responses import HTMLResponse
     return HTMLResponse(content=snap_path.read_text(encoding="utf-8", errors="replace"))
 
 
