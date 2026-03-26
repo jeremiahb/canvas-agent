@@ -23,7 +23,7 @@ from typing import Callable, Optional
 
 from playwright.async_api import async_playwright, BrowserContext, Page
 
-from agent.document_ingester import DocumentIngester, extract_html_text
+from agent.document_ingester import DocumentIngester
 
 logger = logging.getLogger(__name__)
 
@@ -177,28 +177,6 @@ class CanvasCrawler:
         return True
 
     # ------------------------------------------------------------------ #
-    #  REST API helper                                                     #
-    # ------------------------------------------------------------------ #
-
-    async def _api_get(self, path: str) -> list | dict:
-        """
-        Fetch a Canvas REST API endpoint using the current session cookies.
-        Uses Playwright's API client so it shares the authenticated browser
-        session without needing a separate token.
-        Returns parsed JSON (list or dict) or empty list on failure.
-        """
-        url = f"{self.base_url}{path}"
-        try:
-            response = await self.page.context.request.get(url)
-            if not response.ok:
-                logger.warning(f"API {path} returned {response.status}")
-                return []
-            return await response.json()
-        except Exception as e:
-            logger.warning(f"API request failed for {path}: {e}")
-            return []
-
-    # ------------------------------------------------------------------ #
     #  Courses                                                             #
     # ------------------------------------------------------------------ #
 
@@ -279,85 +257,100 @@ class CanvasCrawler:
     # ------------------------------------------------------------------ #
 
     async def get_assignments(self, course_id: str) -> list:
-        """Return all assignments for a course via REST API (includes description inline)."""
-        data = await self._api_get(
-            f"/api/v1/courses/{course_id}/assignments"
-            "?per_page=100&order_by=due_at&include[]=submission&include[]=rubric_assessment"
-        )
+        """Return all assignments for a course."""
+        await self._goto(f"{self.base_url}/courses/{course_id}/assignments")
+        # Wait briefly for React to render — primary selector often doesn't appear
+        # so we proceed quickly to the link fallback which always works
+        await self.page.wait_for_timeout(1500)
+
         assignments = []
-        for a in (data if isinstance(data, list) else []):
-            sub = a.get("submission") or {}
-            rubric = []
-            for crit in (a.get("rubric") or []):
-                rubric.append({
-                    "criterion": crit.get("description", ""),
-                    "description": crit.get("long_description", ""),
-                    "points": str(crit.get("points", "")),
-                })
-            assignments.append({
-                "id": str(a["id"]),
-                "title": a.get("name", "").strip(),
-                "url": a.get("html_url", f"{self.base_url}/courses/{course_id}/assignments/{a['id']}"),
-                "due": a.get("due_at") or "No due date",
-                "points": str(a.get("points_possible") or ""),
-                "submission_types": a.get("submission_types", []),
-                "description": extract_html_text(a.get("description") or ""),
-                "submitted_at": sub.get("submitted_at") or "",
-                "workflow_state": sub.get("workflow_state") or "",
-                "rubric": rubric,
-                "details": {},
-            })
-            logger.debug(f"  [ASSIGN] {a.get('name')} due={a.get('due_at')}")
+
+        # Try primary Canvas selectors (.assignment-group > .assignment)
+        groups = await self.page.query_selector_all(".assignment-group")
+        if groups:
+            for group in groups:
+                for item in await group.query_selector_all(".assignment"):
+                    try:
+                        link = await item.query_selector("a.ig-title")
+                        if not link:
+                            continue
+                        href = await link.get_attribute("href") or ""
+                        if "/assignments/" not in href:
+                            continue
+                        due_el = await item.query_selector(".assignment-date-due")
+                        points_el = await item.query_selector(".non-screenreader")
+                        assignments.append({
+                            "id": href.split("/assignments/")[1].split("/")[0],
+                            "title": (await link.inner_text()).strip(),
+                            "url": f"{self.base_url}{href}",
+                            "due": (await due_el.inner_text()).strip() if due_el else "No due date",
+                            "points": (await points_el.inner_text()).strip() if points_el else "",
+                            "details": None,
+                        })
+                    except Exception as e:
+                        logger.warning(f"Error parsing assignment item: {e}")
+
+        # Fallback: scan all assignment links directly — always works regardless of CSS class
+        if not assignments:
+            logger.info(f"Using link fallback for course {course_id}")
+            links = await self.page.query_selector_all("a[href*='/assignments/']")
+            seen = set()
+            for link in links:
+                try:
+                    href = await link.get_attribute("href") or ""
+                    if "/assignments/" not in href or href in seen:
+                        continue
+                    if "syllabus" in href or "submissions" in href:
+                        continue
+                    seen.add(href)
+                    title = (await link.inner_text()).strip()
+                    if not title:
+                        continue
+                    aid = href.split("/assignments/")[1].split("/")[0]
+                    if not aid.isdigit():
+                        continue
+                    assignments.append({
+                        "id": aid,
+                        "title": title,
+                        "url": f"{self.base_url}{href}" if href.startswith("/") else href,
+                        "due": "No due date",
+                        "points": "",
+                        "details": None,
+                    })
+                except Exception as e:
+                    logger.warning(f"Error in link fallback: {e}")
+
         return assignments
 
     async def get_assignment_details(self, assignment_url: str) -> dict:
-        """
-        Return description, submission types, points, and rubric for one assignment
-        by fetching the assignment via REST API.  Falls back to browser scraping
-        if the assignment ID cannot be parsed from the URL.
-        """
-        # Extract course_id and assignment_id from URL like /courses/123/assignments/456
-        m = re.search(r"/courses/(\d+)/assignments/(\d+)", assignment_url)
-        if m:
-            course_id, assignment_id = m.group(1), m.group(2)
-            data = await self._api_get(
-                f"/api/v1/courses/{course_id}/assignments/{assignment_id}"
-            )
-            if isinstance(data, dict) and "id" in data:
-                rubric = [
-                    {
-                        "criterion": c.get("description", ""),
-                        "description": c.get("long_description", ""),
-                        "points": str(c.get("points", "")),
-                    }
-                    for c in (data.get("rubric") or [])
-                ]
-                return {
-                    "description": extract_html_text(data.get("description") or ""),
-                    "submission_types": data.get("submission_types", []),
-                    "points_possible": str(data.get("points_possible") or ""),
-                    "rubric": rubric,
-                }
-
-        # Browser fallback for unusual URL shapes
+        """Return description, submission types, points, and rubric for one assignment."""
         await self._goto(assignment_url)
         try:
             await self.page.wait_for_selector("#assignment_description, .assignment-description", timeout=8000)
         except Exception:
             await self.page.wait_for_timeout(2000)
 
-        details: dict = {"description": "", "submission_types": [], "points_possible": "", "rubric": []}
+        details: dict = {
+            "description": "",
+            "submission_types": [],
+            "points_possible": "",
+            "rubric": [],
+        }
+
         try:
             desc_el = await self.page.query_selector("#assignment_description")
             if desc_el:
                 details["description"] = await desc_el.inner_text()
+
             details["submission_types"] = [
                 await el.inner_text()
                 for el in await self.page.query_selector_all(".submission_type")
             ]
+
             pts_el = await self.page.query_selector(".points_possible")
             if pts_el:
                 details["points_possible"] = await pts_el.inner_text()
+
             for row in await self.page.query_selector_all(".rubric_criterion"):
                 desc = await row.query_selector(".description")
                 long_desc = await row.query_selector(".long_description")
@@ -367,8 +360,10 @@ class CanvasCrawler:
                     "description": await long_desc.inner_text() if long_desc else "",
                     "points": await pts.inner_text() if pts else "",
                 })
+
         except Exception as e:
             logger.warning(f"Error parsing details at {assignment_url}: {e}", exc_info=True)
+
         return details
 
     # ------------------------------------------------------------------ #
@@ -376,18 +371,27 @@ class CanvasCrawler:
     # ------------------------------------------------------------------ #
 
     async def get_announcements(self, course_id: str) -> list:
-        """Return all announcements for a course via REST API."""
-        data = await self._api_get(
-            f"/api/v1/courses/{course_id}/discussion_topics"
-            "?only_announcements=true&per_page=50&order_by=posted_at&scope=unlocked"
-        )
+        """Return all announcements for a course."""
+        await self._goto(f"{self.base_url}/courses/{course_id}/announcements")
+        try:
+            await self.page.wait_for_selector(".ic-announcement-row, .discussion-topic", timeout=8000)
+        except Exception:
+            await self.page.wait_for_timeout(2000)
+
         announcements = []
-        for a in (data if isinstance(data, list) else []):
-            announcements.append({
-                "title": a.get("title", ""),
-                "date": a.get("posted_at", ""),
-                "message": extract_html_text(a.get("message") or ""),
-            })
+        for item in await self.page.query_selector_all(".ic-announcement-row"):
+            try:
+                title_el = await item.query_selector(".ic-announcement-row__content-title")
+                date_el = await item.query_selector("time")
+                title = (await title_el.inner_text()).strip() if title_el else ""
+                if title:
+                    announcements.append({
+                        "title": title,
+                        "date": await date_el.get_attribute("datetime") if date_el else "",
+                    })
+            except Exception as e:
+                logger.warning(f"Error parsing announcement: {e}", exc_info=True)
+
         return announcements
 
     # ------------------------------------------------------------------ #
@@ -395,29 +399,42 @@ class CanvasCrawler:
     # ------------------------------------------------------------------ #
 
     async def get_modules(self, course_id: str) -> list:
-        """
-        Return all modules and their items via REST API.
-        The API returns real item URLs — not the {{ id }} Handlebars
-        placeholders that the browser DOM exposes before React renders.
-        """
-        data = await self._api_get(
-            f"/api/v1/courses/{course_id}/modules?include[]=items&per_page=100"
-        )
+        """Return all modules and their items for a course."""
+        await self._goto(f"{self.base_url}/courses/{course_id}/modules")
+        try:
+            await self.page.wait_for_selector(".context_module", timeout=8000)
+        except Exception:
+            await self.page.wait_for_timeout(2000)
+        # Extra settle time for Canvas's React to finish populating item hrefs.
+        # Without this, ExternalTool items have {{ id }} placeholder hrefs.
+        await self.page.wait_for_timeout(3000)
+
         modules = []
-        for mod in (data if isinstance(data, list) else []):
-            items = []
-            for item in mod.get("items", []):
-                url = item.get("html_url") or item.get("url") or ""
-                items.append({
-                    "title": item.get("title", ""),
-                    "url": url,
-                    "type": item.get("type", ""),
-                    "content_id": str(item.get("content_id") or ""),
-                })
-            modules.append({
-                "name": mod.get("name", "Unnamed Module"),
-                "items": items,
-            })
+        for mod in await self.page.query_selector_all(".context_module"):
+            try:
+                name_el = await mod.query_selector(".ig-header-title")
+                name = (await name_el.inner_text()).strip() if name_el else "Unnamed Module"
+
+                items = []
+                for item in await mod.query_selector_all(".context_module_item"):
+                    link = await item.query_selector("a.title")
+                    if link:
+                        item_href = await link.get_attribute("href") or ""
+                        # Skip Handlebars template placeholders that React hasn't
+                        # rendered yet — these look like /external_tools/1?...={{ id }}
+                        if "{{" in item_href or "}}" in item_href:
+                            logger.debug(f"Skipping unrendered module item href: {item_href!r}")
+                            continue
+                        items.append({
+                            "title": (await link.inner_text()).strip(),
+                            "url": f"{self.base_url}{item_href}" if item_href.startswith("/") else item_href,
+                        })
+
+                modules.append({"name": name, "items": items})
+
+            except Exception as e:
+                logger.warning(f"Error parsing module: {e}", exc_info=True)
+
         return modules
 
     # ------------------------------------------------------------------ #
@@ -425,21 +442,30 @@ class CanvasCrawler:
     # ------------------------------------------------------------------ #
 
     async def get_grades(self, course_id: str) -> list:
-        """Return grades for all assignments via REST API (submission data included)."""
-        data = await self._api_get(
-            f"/api/v1/courses/{course_id}/assignments"
-            "?per_page=100&include[]=submission"
-        )
+        """Return all graded assignments for a course."""
+        await self._goto(f"{self.base_url}/courses/{course_id}/grades")
+        try:
+            await self.page.wait_for_selector("tr.student_assignment, .gradebook-cell", timeout=8000)
+        except Exception:
+            await self.page.wait_for_timeout(2000)
+
         grades = []
-        for a in (data if isinstance(data, list) else []):
-            sub = a.get("submission") or {}
-            grades.append({
-                "assignment": a.get("name", ""),
-                "score": str(sub.get("score") if sub.get("score") is not None else "-"),
-                "possible": str(a.get("points_possible") or "-"),
-                "submitted_at": sub.get("submitted_at") or "",
-                "workflow_state": sub.get("workflow_state") or "unsubmitted",
-            })
+        for row in await self.page.query_selector_all("tr.student_assignment"):
+            try:
+                title_el = await row.query_selector(".title a")
+                score_el = await row.query_selector(".score")
+                possible_el = await row.query_selector(".possible")
+
+                title = (await title_el.inner_text()).strip() if title_el else ""
+                if title:
+                    grades.append({
+                        "assignment": title,
+                        "score": (await score_el.inner_text()).strip() if score_el else "-",
+                        "possible": (await possible_el.inner_text()).strip() if possible_el else "-",
+                    })
+            except Exception as e:
+                logger.warning(f"Error parsing grade row: {e}", exc_info=True)
+
         return grades
 
     # ------------------------------------------------------------------ #
@@ -447,33 +473,11 @@ class CanvasCrawler:
     # ------------------------------------------------------------------ #
 
     async def get_syllabus(self, course_id: str) -> str:
-        """Return the plain-text syllabus for a course via REST API."""
-        data = await self._api_get(
-            f"/api/v1/courses/{course_id}?include[]=syllabus_body"
-        )
-        if isinstance(data, dict):
-            return extract_html_text(data.get("syllabus_body") or "")
-        return ""
-
-    # ------------------------------------------------------------------ #
-    #  Discussions                                                         #
-    # ------------------------------------------------------------------ #
-
-    async def get_discussions(self, course_id: str) -> list:
-        """Return all discussion topics for a course via REST API."""
-        data = await self._api_get(
-            f"/api/v1/courses/{course_id}/discussion_topics"
-            "?per_page=50&order_by=recent_activity&scope=unlocked"
-        )
-        discussions = []
-        for d in (data if isinstance(data, list) else []):
-            discussions.append({
-                "title": d.get("title", ""),
-                "posted_at": d.get("posted_at", ""),
-                "message": extract_html_text(d.get("message") or ""),
-                "url": d.get("html_url", ""),
-            })
-        return discussions
+        """Return the plain-text syllabus for a course."""
+        await self._goto(f"{self.base_url}/courses/{course_id}/assignments/syllabus")
+        await self.page.wait_for_timeout(500)
+        el = await self.page.query_selector("#course_syllabus")
+        return (await el.inner_text()) if el else ""
 
     # ------------------------------------------------------------------ #
     #  Page snapshot saving                                               #
@@ -526,30 +530,40 @@ class CanvasCrawler:
 
             logger.info(f"[CRAWL] {course['name']}")
 
-            # All structured data fetched via REST API — no browser navigation needed
-            course["syllabus"]      = await self.get_syllabus(cid)
+            course["syllabus"] = await self.get_syllabus(cid)
+            await self._save_page_snapshot(f"{slug}_{cid}_syllabus")
+
             course["announcements"] = await self.get_announcements(cid)
-            course["modules"]       = await self.get_modules(cid)
-            course["grades"]        = await self.get_grades(cid)
-            course["discussions"]   = await self.get_discussions(cid)
+            await self._save_page_snapshot(f"{slug}_{cid}_announcements")
+
+            course["modules"] = await self.get_modules(cid)
+            await self._save_page_snapshot(f"{slug}_{cid}_modules")
+
+            course["grades"] = await self.get_grades(cid)
+            await self._save_page_snapshot(f"{slug}_{cid}_grades")
 
             assignments = await self.get_assignments(cid)
+            await self._save_page_snapshot(f"{slug}_{cid}_assignments")
             logger.info(f"  Found {len(assignments)} assignments")
+
+            # Skip per-assignment detail pages during bulk crawl — they each cost
+            # a full page navigation + delay. Details are fetched on-demand when
+            # the user generates a specific assignment.
             for a in assignments:
-                logger.info(f"  -> {a['title']} (due={a['due']})")
+                logger.info(f"  -> {a['title']}")
+                a["details"] = {}  # populated on-demand via get_assignment_details()
+
             course["assignments"] = assignments
 
-            # Document ingester: pass pre-fetched modules so it can process
-            # module item URLs without re-navigating to the modules page.
+            # RF-Ingester-bypass: pass _polite_goto so the ingester uses
+            # the same rate-limiting behaviour as the crawler.
             logger.info(f"  Ingesting documents for: {course['name']}")
             ingester = DocumentIngester(
                 page=self.page,
                 base_url=self.base_url,
                 goto_fn=_polite_goto,
             )
-            doc_results = await ingester.ingest_course_documents(
-                cid, course["name"], modules=course["modules"]
-            )
+            doc_results = await ingester.ingest_course_documents(cid, course["name"])
             course["documents"] = doc_results["ingested"]
             course["flagged_external"] = doc_results["flagged"]
             logger.info(
