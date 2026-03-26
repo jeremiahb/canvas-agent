@@ -377,6 +377,19 @@ class CanvasCrawler:
         except Exception as e:
             logger.warning(f"Error parsing details at {assignment_url}: {e}", exc_info=True)
 
+        # Vision: capture rubric tables, diagrams, and other visual content
+        from agent.brain import describe_page_visuals
+        try:
+            screenshot = await self.page.screenshot(full_page=True)
+            vision_text = await describe_page_visuals(screenshot, assignment_url)
+            if vision_text:
+                details["description"] = (
+                    (details["description"] + "\n\n" if details["description"] else "")
+                    + f"[VISUAL CONTENT]\n{vision_text}"
+                )
+        except Exception as e:
+            logger.warning(f"Vision failed for assignment {assignment_url}: {e}")
+
         return details
 
     # ------------------------------------------------------------------ #
@@ -550,8 +563,15 @@ class CanvasCrawler:
 
             logger.info(f"[CRAWL] {course['name']}")
 
-            course["syllabus"] = await self.get_syllabus(cid)
+            raw_syllabus = await self.get_syllabus(cid)
             await self._save_page_snapshot(f"{slug}_{cid}_syllabus")
+            if raw_syllabus:
+                from agent.brain import enrich_for_knowledge_base
+                course["syllabus"] = await enrich_for_knowledge_base(
+                    raw_syllabus, "Syllabus", course["name"], "syllabus"
+                )
+            else:
+                course["syllabus"] = raw_syllabus
 
             course["announcements"] = await self.get_announcements(cid)
             await self._save_page_snapshot(f"{slug}_{cid}_announcements")

@@ -17,6 +17,8 @@ Review fixes applied:
                      second-precision collisions
 """
 
+import asyncio
+import base64
 import json
 import logging
 import os
@@ -97,6 +99,137 @@ FREE_MODELS = [
     {"id": "meta-llama/llama-3.3-70b-instruct:free", "label": "Llama 3.3 70B (free) · 131K ctx · reliable"},
     {"id": "anthropic/claude-sonnet-4-5", "label": "Claude Sonnet 4.5 (paid) · best quality"},
 ]
+
+
+# Default free vision model on OpenRouter — swap via VISION_MODEL env var
+_VISION_MODEL_DEFAULT = "meta-llama/llama-3.2-11b-vision-instruct:free"
+
+
+async def describe_page_visuals(screenshot_bytes: bytes, context: str = "") -> str:
+    """
+    Send a full-page screenshot to a vision model and return extracted content.
+
+    Only runs when VISION_ENABLED=true and OPENROUTER_API_KEY is set.
+    Model is controlled by the VISION_MODEL env var so you can swap to any
+    vision-capable model on OpenRouter without a redeploy.
+
+    Returns an empty string (silently) if vision is disabled or unavailable,
+    so callers can always do: text += await describe_page_visuals(...) safely.
+    """
+    if os.environ.get("VISION_ENABLED", "").lower() not in ("1", "true"):
+        return ""
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not openrouter_key:
+        logger.warning("VISION_ENABLED=true but OPENROUTER_API_KEY not set — skipping vision")
+        return ""
+
+    vision_model = os.environ.get("VISION_MODEL", _VISION_MODEL_DEFAULT)
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+        b64 = base64.b64encode(screenshot_bytes).decode()
+        prompt = (
+            "Extract all meaningful content from this Canvas LMS page screenshot. "
+            "Focus on: tables and their full data, rubric criteria and point values, "
+            "diagrams or charts with their labels, any text embedded in images, "
+            "and structured content that plain HTML scraping would miss. "
+            "Be concise — only report content that adds information beyond plain text."
+        )
+        if context:
+            prompt = f"Page: {context}\n\n{prompt}"
+
+        response = await client.chat.completions.create(
+            model=vision_model,
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+
+        result = (response.choices[0].message.content or "").strip()
+        if result:
+            logger.info(f"Vision: {len(result)} chars extracted from {context or 'page'}")
+        return result
+
+    except Exception as e:
+        logger.warning(f"Vision extraction failed for {context!r}: {e}")
+        return ""
+
+
+async def enrich_for_knowledge_base(
+    text: str,
+    title: str,
+    course_name: str = "",
+    doc_type: str = "document",
+    url: str = "",
+) -> str:
+    """
+    Summarise and structure a document using the AI so the knowledge base
+    contains meaningful, searchable notes rather than raw scraped text.
+
+    Only runs when AI_ENRICHMENT_ENABLED=true and an AI key is configured.
+    Always returns the original text on failure so ingestion is never blocked.
+
+    Uses asyncio.get_running_loop().run_in_executor to call the synchronous
+    _call_api without blocking the Playwright event loop.
+    """
+    if os.environ.get("AI_ENRICHMENT_ENABLED", "").lower() not in ("1", "true"):
+        return text
+    if not text.strip():
+        return text
+
+    context_lines = []
+    if course_name:
+        context_lines.append(f"Course: {course_name}")
+    context_lines.append(f"Title: {title}")
+    context_lines.append(f"Type: {doc_type}")
+    if url:
+        context_lines.append(f"URL: {url}")
+    context_block = "\n".join(context_lines)
+
+    # Limit input to avoid token overflows on large files; 20k chars ≈ ~5k tokens
+    truncated = text[:20000]
+    if len(text) > 20000:
+        truncated += f"\n\n[... {len(text) - 20000:,} more characters truncated ...]"
+
+    prompt = (
+        f"{context_block}\n\n"
+        f"Document content:\n{truncated}\n\n"
+        "You are a diligent student building a comprehensive class notebook. "
+        "Transform this document into detailed, well-organised notes that capture EVERYTHING "
+        "a student would need to know. Include:\n"
+        "- All key concepts, definitions, and theories explained in your own words\n"
+        "- Every deadline, date, exam, or schedule item\n"
+        "- Full assignment instructions, rubric criteria, and grading breakdowns\n"
+        "- Required readings, resources, or tools referenced\n"
+        "- Important policies (late work, attendance, academic integrity, etc.)\n"
+        "- Instructor expectations and hints about what matters\n"
+        "- Any formulas, frameworks, or step-by-step processes\n"
+        "- Action items the student must complete\n\n"
+        "Be thorough — this is a reference notebook, not a quick summary. "
+        "Use headings and bullet points. Skip only pure navigation/boilerplate HTML text."
+    )
+
+    try:
+        loop = asyncio.get_running_loop()
+        summary = await loop.run_in_executor(None, lambda: _call_api(prompt))
+        if summary:
+            logger.info(f"Enriched: {title!r} ({len(summary)} chars summary)")
+            return text + f"\n\n[AI KNOWLEDGE SUMMARY]\n{summary}"
+    except Exception as e:
+        logger.warning(f"AI enrichment failed for {title!r}: {e}")
+
+    return text
 
 
 def set_model(model_id: str) -> None:
