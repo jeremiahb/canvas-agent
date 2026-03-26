@@ -48,7 +48,19 @@ from agent.document_ingester import extract_text_from_bytes  # RF-InlineImport
 from agent.file_generator import generate_file
 from agent.knowledge_base import KnowledgeBase
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Quiet down noisy third-party libraries at DEBUG level
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("chromadb").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("anthropic").setLevel(logging.WARNING)
+logging.getLogger("playwright").setLevel(logging.INFO)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ #
@@ -337,6 +349,7 @@ async def cookie_status():
 async def run_crawl_task() -> None:
     """Background task: crawl Canvas, ingest knowledge, bust cache."""
     global crawl_status
+    logger.debug("[crawl_task] Background crawl task started")
 
     crawl_status = {"running": True, "last_run": None, "message": "Crawling Canvas..."}
     _save_status(crawl_status)
@@ -344,7 +357,9 @@ async def run_crawl_task() -> None:
     try:
         timed_out = False
 
+        logger.debug("[crawl_task] Launching CanvasCrawler")
         async with CanvasCrawler() as crawler:
+            logger.debug("[crawl_task] Browser started — verifying Canvas session")
             if not await crawler.verify_session():
                 crawl_status = {
                     "running": False,
@@ -352,8 +367,10 @@ async def run_crawl_task() -> None:
                     "message": "Session invalid -- re-upload cookies",
                 }
                 _save_status(crawl_status)
+                logger.debug("[crawl_task] Session invalid — aborting crawl")
                 return
 
+            logger.debug(f"[crawl_task] Session OK — starting crawl (timeout={CRAWL_TIMEOUT_SECONDS}s)")
             # RF-CrawlTimeout: a hard ceiling prevents an infinitely stalled crawl
             # from holding the running lock forever. 2 hours is generous for any
             # realistic Canvas course load.
@@ -378,12 +395,16 @@ async def run_crawl_task() -> None:
                 }
                 _save_status(crawl_status)
                 # Still save whatever was crawled before timeout
+                logger.debug("[crawl_task] Saving partial knowledge after timeout")
                 await crawler.save_knowledge()
 
             if not timed_out:
+                logger.debug("[crawl_task] Crawl finished — saving knowledge JSON")
                 await crawler.save_knowledge()
 
+        logger.debug("[crawl_task] Ingesting knowledge into ChromaDB")
         count = kb.ingest_knowledge()
+        logger.debug(f"[crawl_task] Ingested {count} documents — busting upcoming cache")
         brain.invalidate_upcoming_cache()
 
         if not timed_out:
@@ -408,10 +429,12 @@ async def run_crawl_task() -> None:
 
 @app.post("/api/crawl/start")
 async def start_crawl(background_tasks: BackgroundTasks):
+    logger.debug(f"[POST /api/crawl/start] crawl_status.running={crawl_status.get('running')} cookie_exists={COOKIE_PATH.exists()}")
     if crawl_status.get("running"):
         raise HTTPException(409, "A crawl is already running")
     if not COOKIE_PATH.exists():
         raise HTTPException(400, "No cookies uploaded. Upload cookies first.")
+    logger.debug("[POST /api/crawl/start] Queueing background crawl task")
     background_tasks.add_task(run_crawl_task)
     return {"message": "Crawl started"}
 
@@ -472,11 +495,13 @@ async def search_knowledge(body: ChatMessage):
 @limiter.limit("20/minute")  # RF-RateLimit
 async def chat(request: Request, body: ChatMessage):
     """Chat with the agent. Limited to 20 requests/minute per IP."""
+    logger.debug(f"[POST /api/chat] message={body.message[:80]!r} course={body.course_name!r}")
     try:
         # RF-EventLoop: get_running_loop()
         reply = await asyncio.get_running_loop().run_in_executor(
             None, partial(brain.chat, body.message, body.course_name)
         )
+        logger.debug(f"[POST /api/chat] Reply generated: {len(reply)} chars")
         return {"reply": reply, "timestamp": datetime.now().isoformat()}
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
@@ -496,14 +521,18 @@ async def reset_chat(body: ResetConversation):
 
 @app.post("/api/assignments/analyze/{assignment_id}")
 async def analyze_assignment(assignment_id: str):
+    logger.debug(f"[POST /api/assignments/analyze] assignment_id={assignment_id!r}")
     result = kb.get_assignment_by_id(assignment_id)
     if not result:
+        logger.debug(f"[POST /api/assignments/analyze] Assignment not found: {assignment_id}")
         raise HTTPException(404, f"Assignment '{assignment_id}' not found")
 
+    logger.debug(f"[POST /api/assignments/analyze] Found assignment: {result['metadata'].get('title')!r} — sending to brain")
     # RF-EventLoop
     analysis = await asyncio.get_running_loop().run_in_executor(
         None, partial(brain.analyze_assignment, result["document"])
     )
+    logger.debug(f"[POST /api/assignments/analyze] Analysis complete: type={analysis.get('ESTIMATED_TYPE')!r} confidence={analysis.get('CONFIDENCE')}")
     return {"assignment_id": assignment_id, "analysis": analysis}
 
 
@@ -511,20 +540,25 @@ async def analyze_assignment(assignment_id: str):
 @limiter.limit("5/minute")  # RF-RateLimit: generation is expensive
 async def generate_assignment(request: Request, assignment_id: str):
     """Generate a draft for an assignment. Limited to 5 requests/minute per IP."""
+    logger.debug(f"[POST /api/assignments/generate] assignment_id={assignment_id!r}")
     result = kb.get_assignment_by_id(assignment_id)
     if not result:
+        logger.debug(f"[POST /api/assignments/generate] Assignment not found: {assignment_id}")
         raise HTTPException(404, f"Assignment '{assignment_id}' not found")
 
     doc = result["document"]
     meta = result["metadata"]
+    logger.debug(f"[POST /api/assignments/generate] Analyzing: {meta.get('title')!r} for {meta.get('course_name')!r}")
 
     # RF-EventLoop
     analysis = await asyncio.get_running_loop().run_in_executor(
         None, partial(brain.analyze_assignment, doc)
     )
     file_type = (analysis.get("ESTIMATED_TYPE") or "docx").lower()
+    logger.debug(f"[POST /api/assignments/generate] Analysis done — file_type={file_type!r} confidence={analysis.get('CONFIDENCE')}")
 
     if file_type in ("manual", "code"):
+        logger.debug(f"[POST /api/assignments/generate] Copilot mode required for file_type={file_type!r}")
         return {
             "assignment_id": assignment_id,
             "mode": "copilot",
@@ -532,13 +566,16 @@ async def generate_assignment(request: Request, assignment_id: str):
             "message": "This assignment requires co-pilot mode. Start a chat to work through it.",
         }
 
+    logger.debug(f"[POST /api/assignments/generate] Generating {file_type} content via brain")
     # RF-EventLoop
     content = await asyncio.get_running_loop().run_in_executor(
         None, partial(brain.generate_content, doc, file_type)
     )
+    logger.debug(f"[POST /api/assignments/generate] Content generated: {len(content)} chars — writing file")
 
     try:
         filepath = generate_file(content, meta.get("title", "Assignment"), file_type)
+        logger.debug(f"[POST /api/assignments/generate] File written: {filepath}")
     except Exception as e:
         logger.error(f"File generation error: {e}", exc_info=True)
         raise HTTPException(500, "File generation failed -- check server logs")
@@ -643,6 +680,7 @@ async def upload_document_text(body: ManualDocument):
     Manually add a reading or document to the knowledge base by pasting text.
     Use this for VitalSource, Pearson, or any resource the agent could not access.
     """
+    logger.debug(f"[POST /api/documents/upload] title={body.title!r} course={body.course_name!r} text_len={len(body.text)}")
     if not body.text.strip():
         raise HTTPException(400, "Document text cannot be empty")
     if len(body.text) > 500_000:
@@ -655,6 +693,7 @@ async def upload_document_text(body: ManualDocument):
         course_id=body.course_id or "",
         url=body.url or "",
     )
+    logger.debug(f"[POST /api/documents/upload] Stored with id={doc_id!r}")
     brain.invalidate_upcoming_cache()
     return {
         "message": f"Document '{body.title}' added to knowledge base",
@@ -674,7 +713,9 @@ async def upload_document_file(
     Use this for textbook chapters, instructor PDFs, or any file the crawler could not access.
     RF-MaxBytes: limit constant now at module level.
     """
+    logger.debug(f"[POST /api/documents/upload-file] filename={file.filename!r} content_type={file.content_type!r} course={course_name!r}")
     data = await file.read(MAX_DOCUMENT_UPLOAD_BYTES + 1)
+    logger.debug(f"[POST /api/documents/upload-file] Read {len(data):,} bytes from upload")
     if len(data) > MAX_DOCUMENT_UPLOAD_BYTES:
         raise HTTPException(400, "File too large -- maximum 20 MB")
 
@@ -682,10 +723,13 @@ async def upload_document_file(
     filename = file.filename or ""
     doc_title = title or Path(filename).stem or "Uploaded Document"
 
+    logger.debug(f"[POST /api/documents/upload-file] Extracting text from {filename!r} ({content_type})")
     text = extract_text_from_bytes(data, content_type, filename)  # RF-InlineImport
     if not text.strip():
+        logger.debug(f"[POST /api/documents/upload-file] No text extracted from {filename!r}")
         raise HTTPException(422, "Could not extract text -- try pasting the text instead")
 
+    logger.debug(f"[POST /api/documents/upload-file] Extracted {len(text):,} chars — storing as {doc_title!r}")
     doc_id = kb.add_manual_document(
         title=doc_title,
         text=text,
@@ -693,6 +737,7 @@ async def upload_document_file(
         course_id=course_id or "",
         url="",
     )
+    logger.debug(f"[POST /api/documents/upload-file] Stored with id={doc_id!r}")
     brain.invalidate_upcoming_cache()
     return {
         "message": f"'{doc_title}' ingested ({len(text):,} characters extracted)",

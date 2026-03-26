@@ -263,18 +263,23 @@ class DocumentIngester:
         Discover and ingest all documents for one course.
         Returns dict with 'ingested' (list of text results) and 'flagged' (external links).
         """
+        logger.debug(f"[ingest_course_documents] Starting for course: {course_name} (id={course_id})")
         self.results = []
         self.flagged = []
         self._seen_urls = set()  # reset per course
 
+        logger.debug(f"[ingest_course_documents] Phase 1/3 — ingesting Files page")
         await self._ingest_files_page(course_id, course_name)
+        logger.debug(f"[ingest_course_documents] Phase 2/3 — ingesting Canvas Pages")
         await self._ingest_pages(course_id, course_name)
+        logger.debug(f"[ingest_course_documents] Phase 3/3 — ingesting Module items")
         await self._ingest_module_items(course_id, course_name)
 
         logger.info(
             f"Course {course_name}: ingested {len(self.results)} documents, "
             f"flagged {len(self.flagged)} external links"
         )
+        logger.debug(f"[ingest_course_documents] Done for {course_name} — seen_urls total: {len(self._seen_urls)}")
         return {"ingested": self.results, "flagged": self.flagged}
 
     # ------------------------------------------------------------------ #
@@ -283,6 +288,7 @@ class DocumentIngester:
 
     async def _ingest_files_page(self, course_id: str, course_name: str) -> None:
         """Download every file listed in the Canvas Files section."""
+        logger.debug(f"[_ingest_files_page] Navigating to files for {course_name}")
         try:
             await self._goto(f"{self.base_url}/courses/{course_id}/files")
             try:
@@ -290,11 +296,13 @@ class DocumentIngester:
                     "a.ef-name-col__link, tr.ef-item-row, .ef-directory", timeout=10000
                 )
             except Exception:
+                logger.debug(f"[_ingest_files_page] Selector timeout — falling back to 3s wait")
                 await self.page.wait_for_timeout(3000)
 
             file_links = await self.page.query_selector_all(
                 "a.ef-name-col__link, tr.ef-item-row a[href*='/files/'], a[href*='/download']"
             )
+            logger.debug(f"[_ingest_files_page] Found {len(file_links)} file links for {course_name}")
 
             seen_hrefs: set[str] = set()
             for link in file_links:
@@ -304,6 +312,7 @@ class DocumentIngester:
                     continue
                 seen_hrefs.add(href)
                 full_url = href if href.startswith("http") else f"{self.base_url}{href}"
+                logger.debug(f"[_ingest_files_page] Processing file: {name!r} -> {full_url}")
                 await self._process_url(full_url, name, course_name, source="files")
 
         except Exception as e:
@@ -311,6 +320,7 @@ class DocumentIngester:
 
     async def _ingest_pages(self, course_id: str, course_name: str) -> None:
         """Read all instructor-created Canvas pages for embedded links and content."""
+        logger.debug(f"[_ingest_pages] Navigating to pages index for {course_name}")
         try:
             await self._goto(f"{self.base_url}/courses/{course_id}/pages")
             try:
@@ -318,6 +328,7 @@ class DocumentIngester:
                     "a.wiki-page-link, .pages-index, table.index_content", timeout=8000
                 )
             except Exception:
+                logger.debug(f"[_ingest_pages] Selector timeout — falling back to 2s wait")
                 await self.page.wait_for_timeout(2000)
 
             page_links = await self.page.query_selector_all(
@@ -325,6 +336,7 @@ class DocumentIngester:
                 "table.index_content a[href*='/pages/'], "
                 "a[href*='/courses/'][href*='/pages/']"
             )
+            logger.debug(f"[_ingest_pages] Found {len(page_links)} Canvas page links for {course_name}")
 
             seen_hrefs: set[str] = set()
             for link in page_links:
@@ -336,6 +348,7 @@ class DocumentIngester:
                     continue
                 seen_hrefs.add(href)
                 full_url = href if href.startswith("http") else f"{self.base_url}{href}"
+                logger.debug(f"[_ingest_pages] Scraping Canvas page: {full_url}")
                 # RF-Dedup: checked inside _scrape_canvas_page
                 await self._scrape_canvas_page(full_url, course_name)
 
@@ -344,17 +357,20 @@ class DocumentIngester:
 
     async def _ingest_module_items(self, course_id: str, course_name: str) -> None:
         """Walk all module items and process external URLs and file links."""
+        logger.debug(f"[_ingest_module_items] Navigating to modules for {course_name}")
         try:
             await self._goto(f"{self.base_url}/courses/{course_id}/modules")
             try:
                 await self.page.wait_for_selector(".context_module_item", timeout=8000)
             except Exception:
+                logger.debug(f"[_ingest_module_items] Selector timeout — falling back to 2s wait")
                 await self.page.wait_for_timeout(2000)
             # Extra settle time for React to finish populating item hrefs.
             # Without this, ExternalTool items have {{ id }} Handlebars placeholders.
             await self.page.wait_for_timeout(3000)
 
             items = await self.page.query_selector_all(".context_module_item")
+            logger.debug(f"[_ingest_module_items] Found {len(items)} .context_module_item elements for {course_name}")
 
             for item in items:
                 link = await item.query_selector("a.external_url_link, a[href*='external']")
@@ -384,9 +400,10 @@ class DocumentIngester:
                 # Skip generic help/support domains — not course-specific content
                 parsed_host = urlparse(full_url).netloc.replace("www.", "")
                 if any(d in parsed_host for d in _SKIP_MODULE_DOMAINS):
-                    logger.debug(f"Skipping noise domain: {full_url}")
+                    logger.debug(f"[_ingest_module_items] Skipping noise domain: {full_url}")
                     continue
 
+                logger.debug(f"[_ingest_module_items] Processing module item: {title!r} -> {full_url}")
                 await self._process_url(full_url, title, course_name, source="module")
 
         except Exception as e:
@@ -404,10 +421,12 @@ class DocumentIngester:
         """
         # RF-Dedup + RF-Recursion: global guard for this course's crawl
         if url in self._seen_urls:
+            logger.debug(f"[_process_url] Skipping duplicate URL: {url}")
             return
         self._seen_urls.add(url)
 
         url_type = classify_url(url)
+        logger.debug(f"[_process_url] {url_type.upper()} | {title!r} | source={source} | {url}")
 
         if url_type == "external_platform":
             platform = detect_external_platform(url)
@@ -441,48 +460,60 @@ class DocumentIngester:
         # RF-Dedup: guard at entry so repeated calls from different discovery
         # passes are all caught in one place
         if url in self._seen_urls:
+            logger.debug(f"[_scrape_canvas_page] Skipping duplicate: {url}")
             return
         self._seen_urls.add(url)
 
+        logger.debug(f"[_scrape_canvas_page] Navigating to: {url}")
         try:
             await self._goto(url)
             await asyncio.sleep(0.5)
 
             title_el = await self.page.query_selector("h1.page-title, h1")
             title = (await title_el.inner_text()).strip() if title_el else "Canvas Page"
+            logger.debug(f"[_scrape_canvas_page] Page title: {title!r}")
 
             body_el = await self.page.query_selector(".show-content, #wiki_page_show")
             if body_el:
                 text = await body_el.inner_text()
+                logger.debug(f"[_scrape_canvas_page] Body text: {len(text)} chars")
                 if text.strip():
                     # Vision: supplement text with visual extraction when the page
                     # contains images or tables that plain scraping would miss
                     imgs = await body_el.query_selector_all("img")
                     tables = await body_el.query_selector_all("table")
+                    logger.debug(f"[_scrape_canvas_page] {len(imgs)} images, {len(tables)} tables found on page")
                     if imgs or tables:
+                        logger.debug(f"[_scrape_canvas_page] Vision enabled check — taking screenshot for {url}")
                         from agent.brain import describe_page_visuals
                         try:
                             screenshot = await self.page.screenshot(full_page=True)
+                            logger.debug(f"[_scrape_canvas_page] Screenshot taken: {len(screenshot):,} bytes — sending to vision model")
                             vision_text = await describe_page_visuals(screenshot, url)
                             if vision_text:
+                                logger.debug(f"[_scrape_canvas_page] Vision extracted {len(vision_text)} chars")
                                 text = text.strip() + f"\n\n[VISUAL CONTENT]\n{vision_text}"
                         except Exception as e:
                             logger.warning(f"Vision screenshot failed for {url}: {e}")
+                    logger.debug(f"[_scrape_canvas_page] Enriching {title!r} with AI")
                     from agent.brain import enrich_for_knowledge_base
                     enriched = await enrich_for_knowledge_base(
                         text.strip(), title, course_name, "canvas_page", url
                     )
+                    logger.debug(f"[_scrape_canvas_page] Enriched text: {len(enriched)} chars — storing result")
                     self._store_result(title, enriched, url, course_name, "page", "html_page")
 
             links = await self.page.query_selector_all(
                 ".show-content a[href], #wiki_page_show a[href]"
             )
+            logger.debug(f"[_scrape_canvas_page] Found {len(links)} embedded links on page {title!r}")
             for link in links:
                 href = await link.get_attribute("href") or ""
                 link_title = (await link.inner_text()).strip() or title
                 if not href or href.startswith("#"):
                     continue
                 full_url = href if href.startswith("http") else f"{self.base_url}{href}"
+                logger.debug(f"[_scrape_canvas_page] Embedded link: {link_title!r} -> {full_url}")
                 await self._process_url(full_url, link_title, course_name, source="page_embed")
 
         except Exception as e:

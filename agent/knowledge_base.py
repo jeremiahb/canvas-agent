@@ -101,14 +101,18 @@ class KnowledgeBase:
                 Path(data_dir) / "knowledge" / "canvas_knowledge.json"
             )
 
+        logger.debug(f"[ingest_knowledge] Loading knowledge snapshot from: {knowledge_path}")
         with open(knowledge_path) as f:
             data = json.load(f)
 
+        courses = data.get("courses", [])
+        logger.debug(f"[ingest_knowledge] Snapshot contains {len(courses)} courses — ingesting into ChromaDB")
         total_docs = 0
 
-        for course in data.get("courses", []):
+        for course in courses:
             course_id = str(course.get("id", "unknown"))
             course_name = course.get("name", "Unknown Course")
+            logger.debug(f"[ingest_knowledge] Processing course: {course_name} (id={course_id})")
 
             # --- Course content batch ---
             content_ids: list[str] = []
@@ -175,6 +179,7 @@ class KnowledgeBase:
                 })
 
             if content_ids:
+                logger.debug(f"[ingest_knowledge] Upserting {len(content_ids)} course_content docs for {course_name}")
                 self.course_content.upsert(
                     ids=content_ids,
                     documents=content_docs,
@@ -212,6 +217,7 @@ class KnowledgeBase:
                     })
 
             if doc_ids:
+                logger.debug(f"[ingest_knowledge] Upserting {len(doc_ids)} document chunks for {course_name}")
                 self.documents.upsert(
                     ids=doc_ids,
                     documents=doc_texts,
@@ -295,12 +301,15 @@ class KnowledgeBase:
                 })
 
             if assign_ids:
+                logger.debug(f"[ingest_knowledge] Upserting {len(assign_ids)} assignments for {course_name}")
                 self.assignments.upsert(
                     ids=assign_ids,
                     documents=assign_docs,
                     metadatas=assign_metas,
                 )
                 total_docs += len(assign_ids)
+
+            logger.debug(f"[ingest_knowledge] Course {course_name} done — running total: {total_docs} docs")
 
         logger.info(f"Ingested {total_docs} documents into knowledge base")
         return total_docs
