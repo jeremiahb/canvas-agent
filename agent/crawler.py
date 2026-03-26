@@ -473,43 +473,9 @@ class CanvasCrawler:
 
     async def crawl_all(self) -> dict:
         """Crawl every course and all its content, returning the full knowledge dict."""
-    async def load_existing_knowledge(self, path: str = "") -> dict:
-        """
-        Load the existing knowledge JSON from disk if it exists.
-        Returns an empty structure if no previous crawl has been saved.
-        """
-        if not path:
-            data_dir = os.environ.get("DATA_DIR", "data")
-            path = str(Path(data_dir) / "knowledge" / "canvas_knowledge.json")
-        p = Path(path)
-        if p.exists():
-            try:
-                return json.loads(p.read_text())
-            except Exception as e:
-                logger.warning(f"Could not load existing knowledge: {e}")
-        return {"crawled_at": None, "courses": []}
-
-    async def crawl_all(self) -> dict:
-        """
-        Crawl every course and merge results into the persistent knowledge store.
-
-        Merge strategy:
-          - Courses found this crawl are updated in place (by course ID).
-          - Courses NOT found this crawl (e.g. finished terms) are preserved
-            as-is so their assignments remain searchable.
-          - Assignments within each course are merged by assignment ID so
-            newly added assignments appear and updated ones are refreshed
-            without wiping previously crawled details.
-        """
         logger.info("[START] Full Canvas crawl")
-
-        # Load existing knowledge so we can merge into it rather than overwrite
-        existing = await self.load_existing_knowledge()
-        existing_by_id: dict = {str(c["id"]): c for c in existing.get("courses", [])}
-
         self.knowledge["crawled_at"] = datetime.now().isoformat()
-        # Start from the existing course set — we will update/add to it
-        self.knowledge["courses"] = list(existing_by_id.values())
+        self.knowledge["courses"] = []
 
         courses = await self.get_courses()
 
@@ -517,8 +483,9 @@ class CanvasCrawler:
             cid = course["id"]
             slug = re.sub(r"[^\w]", "_", course["name"])[:30]
 
+            # Skip admin/orientation courses — no real assignments
             if any(f.lower() in course["name"].lower() for f in _SKIP_COURSE_FRAGMENTS):
-                logger.info(f"[SKIP] {course['name']} -- non-academic course")
+                logger.info(f"[SKIP] {course['name']} — non-academic course")
                 continue
 
             logger.info(f"[CRAWL] {course['name']}")
@@ -535,26 +502,21 @@ class CanvasCrawler:
             course["grades"] = await self.get_grades(cid)
             await self._save_page_snapshot(f"{slug}_{cid}_grades")
 
-            new_assignments = await self.get_assignments(cid)
+            assignments = await self.get_assignments(cid)
             await self._save_page_snapshot(f"{slug}_{cid}_assignments")
-            logger.info(f"  Found {len(new_assignments)} assignments")
+            logger.info(f"  Found {len(assignments)} assignments")
 
-            # Merge assignments: preserve existing details/status, add new ones
-            existing_course = existing_by_id.get(str(cid), {})
-            old_assignments = {
-                str(a["id"]): a
-                for a in existing_course.get("assignments", [])
-            }
-            merged_assignments = []
-            for a in new_assignments:
-                old = old_assignments.get(str(a["id"]), {})
-                # Carry forward details and status from previous crawl
-                a["details"] = old.get("details") or {}
-                a["status"] = old.get("status", "pending")
-                merged_assignments.append(a)
+            # Skip per-assignment detail pages during bulk crawl — they each cost
+            # a full page navigation + delay. Details are fetched on-demand when
+            # the user generates a specific assignment.
+            for a in assignments:
+                logger.info(f"  -> {a['title']}")
+                a["details"] = {}  # populated on-demand via get_assignment_details()
 
-            course["assignments"] = merged_assignments
+            course["assignments"] = assignments
 
+            # RF-Ingester-bypass: pass _polite_goto so the ingester uses
+            # the same rate-limiting behaviour as the crawler.
             logger.info(f"  Ingesting documents for: {course['name']}")
             ingester = DocumentIngester(
                 page=self.page,
@@ -569,35 +531,20 @@ class CanvasCrawler:
                 f"{len(doc_results['flagged'])} flagged"
             )
 
-            # Update or insert this course in the knowledge store
-            existing_by_id[str(cid)] = course
+            self.knowledge["courses"].append(course)
 
-        # Rebuild courses list — only courses found in this crawl
-        self.knowledge["courses"] = [
-            existing_by_id[str(c["id"])] for c in courses
-            if str(c["id"]) in existing_by_id
-        ]
-
-        total = sum(len(c.get("assignments", [])) for c in self.knowledge["courses"])
-        logger.info(
-            f"[DONE] Crawl complete -- {len(self.knowledge['courses'])} courses, "
-            f"{total} total assignments in knowledge store"
-        )
+        logger.info(f"[DONE] Crawl complete -- {len(courses)} courses indexed")  # RF-24
         return self.knowledge
 
     async def save_knowledge(self, path: str = "") -> None:
-        """Atomically persist the merged knowledge snapshot to disk."""
+        """Persist the crawl snapshot to disk."""
         if not path:
             data_dir = os.environ.get("DATA_DIR", "data")
             path = str(Path(data_dir) / "knowledge" / "canvas_knowledge.json")
         dest = Path(path)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        # Write to a temp file first then rename — prevents corruption if
-        # the process is killed mid-write
-        tmp = dest.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.knowledge, indent=2))
-        tmp.replace(dest)
-        logger.info(f"Knowledge saved to {path} ({len(self.knowledge['courses'])} courses)")
+        dest.write_text(json.dumps(self.knowledge, indent=2))
+        logger.info(f"Knowledge saved to {path}")
 
 
 # ------------------------------------------------------------------ #
