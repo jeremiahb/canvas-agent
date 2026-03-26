@@ -26,4 +26,4 @@ RUN cd dashboard && npm run build
 # Copy application code last so code changes don't bust the layers above
 COPY . .
 
-CMD uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8080}
+CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
