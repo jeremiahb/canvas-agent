@@ -242,13 +242,33 @@ class DocumentIngester:
             await asyncio.sleep(1.0)
             await self.page.goto(url, wait_until="networkidle")
 
+    async def _api_get(self, path: str) -> list | dict:
+        """Fetch a Canvas REST API path using the existing session cookies."""
+        url = f"{self.base_url}{path}"
+        try:
+            response = await self.page.context.request.get(url)
+            if not response.ok:
+                logger.warning(f"Ingester API {path} returned {response.status}")
+                return []
+            return await response.json()
+        except Exception as e:
+            logger.warning(f"Ingester API request failed for {path}: {e}")
+            return []
+
     # ------------------------------------------------------------------ #
     #  Public entry point                                                  #
     # ------------------------------------------------------------------ #
 
-    async def ingest_course_documents(self, course_id: str, course_name: str) -> dict:
+    async def ingest_course_documents(
+        self,
+        course_id: str,
+        course_name: str,
+        modules: list | None = None,
+    ) -> dict:
         """
         Discover and ingest all documents for one course.
+        modules: pre-fetched module data from CanvasCrawler.get_modules() —
+                 if provided, skips re-navigating to the modules page.
         Returns dict with 'ingested' (list of text results) and 'flagged' (external links).
         """
         self.results = []
@@ -257,7 +277,7 @@ class DocumentIngester:
 
         await self._ingest_files_page(course_id, course_name)
         await self._ingest_pages(course_id, course_name)
-        await self._ingest_module_items(course_id, course_name)
+        await self._ingest_module_items(course_id, course_name, modules=modules)
 
         logger.info(
             f"Course {course_name}: ingested {len(self.results)} documents, "
@@ -270,85 +290,69 @@ class DocumentIngester:
     # ------------------------------------------------------------------ #
 
     async def _ingest_files_page(self, course_id: str, course_name: str) -> None:
-        """Download every file listed in the Canvas Files section."""
+        """Download every file listed in the course via REST API (no browser nav needed)."""
         try:
-            await self._goto(f"{self.base_url}/courses/{course_id}/files")
-            try:
-                await self.page.wait_for_selector("a.ef-name-col__link, tr.ef-item-row", timeout=8000)
-            except Exception:
-                await self.page.wait_for_timeout(2000)
-
-            file_links = await self.page.query_selector_all(
-                "a.ef-name-col__link, a[href*='/files/'], tr.ef-item-row a"
+            data = await self._api_get(
+                f"/api/v1/courses/{course_id}/files?per_page=100&sort=updated_at&order=desc"
             )
-
-            for link in file_links:
-                href = await link.get_attribute("href") or ""
-                name = (await link.inner_text()).strip()
-                if not href:
+            for f in (data if isinstance(data, list) else []):
+                url = f.get("url") or f.get("html_url") or ""
+                name = f.get("display_name") or f.get("filename") or "file"
+                if not url:
                     continue
-                full_url = href if href.startswith("http") else f"{self.base_url}{href}"
-                await self._process_url(full_url, name, course_name, source="files")
-
+                await self._process_url(url, name, course_name, source="files")
         except Exception as e:
-            logger.warning(f"Error ingesting files page for {course_name}: {e}")
+            logger.warning(f"Error ingesting files for {course_name}: {e}")
 
     async def _ingest_pages(self, course_id: str, course_name: str) -> None:
-        """Read all instructor-created Canvas pages for embedded links and content."""
+        """Read all instructor-created Canvas pages via REST API listing, then scrape each."""
         try:
-            await self._goto(f"{self.base_url}/courses/{course_id}/pages")
-            try:
-                await self.page.wait_for_selector("a.wiki-page-link, .pages-index", timeout=8000)
-            except Exception:
-                await self.page.wait_for_timeout(2000)
-
-            page_links = await self.page.query_selector_all(
-                "a.wiki-page-link, table.index_content a[href*='/pages/']"
+            data = await self._api_get(
+                f"/api/v1/courses/{course_id}/pages?per_page=100&sort=updated_at&order=desc"
             )
-
-            for link in page_links:
-                href = await link.get_attribute("href") or ""
-                if not href:
+            for p in (data if isinstance(data, list) else []):
+                url = p.get("html_url") or ""
+                if not url:
                     continue
-                full_url = href if href.startswith("http") else f"{self.base_url}{href}"
-                # RF-Dedup: checked inside _process_url / _scrape_canvas_page
-                await self._scrape_canvas_page(full_url, course_name)
-
+                # RF-Dedup: guard inside _scrape_canvas_page
+                await self._scrape_canvas_page(url, course_name)
         except Exception as e:
             logger.warning(f"Error ingesting pages for {course_name}: {e}")
 
-    async def _ingest_module_items(self, course_id: str, course_name: str) -> None:
-        """Walk all module items and process external URLs and file links."""
+    async def _ingest_module_items(
+        self,
+        course_id: str,
+        course_name: str,
+        modules: list | None = None,
+    ) -> None:
+        """
+        Walk all module items and process external URLs and file links.
+        Uses pre-fetched module data when available (avoids re-navigation and
+        the {{ id }} Handlebars placeholder bug from browser DOM scraping).
+        Falls back to REST API fetch if modules not provided.
+        """
         try:
-            await self._goto(f"{self.base_url}/courses/{course_id}/modules")
-            try:
-                await self.page.wait_for_selector(".context_module_item", timeout=8000)
-            except Exception:
-                await self.page.wait_for_timeout(2000)
+            if modules is None:
+                data = await self._api_get(
+                    f"/api/v1/courses/{course_id}/modules?include[]=items&per_page=100"
+                )
+                modules = data if isinstance(data, list) else []
 
-            items = await self.page.query_selector_all(".context_module_item")
+            for mod in modules:
+                for item in mod.get("items", []):
+                    url = item.get("html_url") or item.get("url") or ""
+                    title = item.get("title", "")
+                    item_type = item.get("type", "")
 
-            for item in items:
-                link = await item.query_selector("a.external_url_link, a[href*='external']")
-                if not link:
-                    link = await item.query_selector("a.title")
-                if not link:
-                    continue
+                    if not url:
+                        continue
 
-                href = await link.get_attribute("href") or ""
-                title = (await link.inner_text()).strip()
+                    # Only process file, page, and external URL items — skip
+                    # Assignment/Quiz items (already captured by get_assignments)
+                    if item_type in ("Assignment", "Quiz", "Discussion"):
+                        continue
 
-                if not href:
-                    continue
-
-                full_url = href if href.startswith("http") else f"{self.base_url}{href}"
-
-                if self.base_url in full_url and not any(
-                    k in full_url for k in ["/files/", "/download", "/pages/", "/external"]
-                ):
-                    continue
-
-                await self._process_url(full_url, title, course_name, source="module")
+                    await self._process_url(url, title, course_name, source="module")
 
         except Exception as e:
             logger.warning(f"Error ingesting module items for {course_name}: {e}")
