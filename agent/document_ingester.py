@@ -427,6 +427,19 @@ class DocumentIngester:
             if body_el:
                 text = await body_el.inner_text()
                 if text.strip():
+                    # Vision: supplement text with visual extraction when the page
+                    # contains images or tables that plain scraping would miss
+                    imgs = await body_el.query_selector_all("img")
+                    tables = await body_el.query_selector_all("table")
+                    if imgs or tables:
+                        from agent.brain import describe_page_visuals
+                        try:
+                            screenshot = await self.page.screenshot(full_page=True)
+                            vision_text = await describe_page_visuals(screenshot, url)
+                            if vision_text:
+                                text = text.strip() + f"\n\n[VISUAL CONTENT]\n{vision_text}"
+                        except Exception as e:
+                            logger.warning(f"Vision screenshot failed for {url}: {e}")
                     self._store_result(title, text.strip(), url, course_name, "page", "html_page")
 
             links = await self.page.query_selector_all(

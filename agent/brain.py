@@ -17,6 +17,7 @@ Review fixes applied:
                      second-precision collisions
 """
 
+import base64
 import json
 import logging
 import os
@@ -97,6 +98,71 @@ FREE_MODELS = [
     {"id": "meta-llama/llama-3.3-70b-instruct:free", "label": "Llama 3.3 70B (free) · 131K ctx · reliable"},
     {"id": "anthropic/claude-sonnet-4-5", "label": "Claude Sonnet 4.5 (paid) · best quality"},
 ]
+
+
+# Default free vision model on OpenRouter — swap via VISION_MODEL env var
+_VISION_MODEL_DEFAULT = "meta-llama/llama-3.2-11b-vision-instruct:free"
+
+
+async def describe_page_visuals(screenshot_bytes: bytes, context: str = "") -> str:
+    """
+    Send a full-page screenshot to a vision model and return extracted content.
+
+    Only runs when VISION_ENABLED=true and OPENROUTER_API_KEY is set.
+    Model is controlled by the VISION_MODEL env var so you can swap to any
+    vision-capable model on OpenRouter without a redeploy.
+
+    Returns an empty string (silently) if vision is disabled or unavailable,
+    so callers can always do: text += await describe_page_visuals(...) safely.
+    """
+    if os.environ.get("VISION_ENABLED", "").lower() not in ("1", "true"):
+        return ""
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not openrouter_key:
+        logger.warning("VISION_ENABLED=true but OPENROUTER_API_KEY not set — skipping vision")
+        return ""
+
+    vision_model = os.environ.get("VISION_MODEL", _VISION_MODEL_DEFAULT)
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+        b64 = base64.b64encode(screenshot_bytes).decode()
+        prompt = (
+            "Extract all meaningful content from this Canvas LMS page screenshot. "
+            "Focus on: tables and their full data, rubric criteria and point values, "
+            "diagrams or charts with their labels, any text embedded in images, "
+            "and structured content that plain HTML scraping would miss. "
+            "Be concise — only report content that adds information beyond plain text."
+        )
+        if context:
+            prompt = f"Page: {context}\n\n{prompt}"
+
+        response = await client.chat.completions.create(
+            model=vision_model,
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+
+        result = (response.choices[0].message.content or "").strip()
+        if result:
+            logger.info(f"Vision: {len(result)} chars extracted from {context or 'page'}")
+        return result
+
+    except Exception as e:
+        logger.warning(f"Vision extraction failed for {context!r}: {e}")
+        return ""
 
 
 def set_model(model_id: str) -> None:

@@ -345,6 +345,19 @@ class CanvasCrawler:
         except Exception as e:
             logger.warning(f"Error parsing details at {assignment_url}: {e}", exc_info=True)
 
+        # Vision: capture rubric tables, diagrams, and other visual content
+        from agent.brain import describe_page_visuals
+        try:
+            screenshot = await self.page.screenshot(full_page=True)
+            vision_text = await describe_page_visuals(screenshot, assignment_url)
+            if vision_text:
+                details["description"] = (
+                    (details["description"] + "\n\n" if details["description"] else "")
+                    + f"[VISUAL CONTENT]\n{vision_text}"
+                )
+        except Exception as e:
+            logger.warning(f"Vision failed for assignment {assignment_url}: {e}")
+
         return details
 
     # ------------------------------------------------------------------ #
