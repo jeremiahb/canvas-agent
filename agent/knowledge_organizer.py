@@ -509,7 +509,10 @@ class KnowledgeOrganizer:
                 except Exception as e:
                     logger.warning(f"canvas_objects fetch failed for {obj_type_val}: {e}")
                     continue
-                for obj_item in objects:
+                for raw_obj in objects:
+                    # get_objects_by_course returns CanvasObject dataclasses; convert to dict
+                    from agent.canvas_schema import canvas_object_to_dict
+                    obj_item = canvas_object_to_dict(raw_obj) if not isinstance(raw_obj, dict) else raw_obj
                     canvas_tasks.append(_process_canvas_object(obj_item, obj_type_val, prompt_key))
             await asyncio.gather(*canvas_tasks)
         except ImportError:
@@ -584,7 +587,20 @@ class KnowledgeOrganizer:
                     cluster_json = cluster_json.split("```")[1]
                     if cluster_json.startswith("json"):
                         cluster_json = cluster_json[4:]
-                clusters = json.loads(cluster_json)
+                try:
+                    clusters = json.loads(cluster_json)
+                except json.JSONDecodeError:
+                    # Recover truncated JSON by trimming to the last complete array item
+                    last_bracket = cluster_json.rfind("]")
+                    last_brace = cluster_json.rfind("}")
+                    if last_brace > 0:
+                        trimmed = cluster_json[:last_brace + 1]
+                        if not trimmed.startswith("["):
+                            trimmed = "[" + trimmed
+                        trimmed = trimmed + "]"
+                        clusters = json.loads(trimmed)
+                    else:
+                        raise
             except Exception as e:
                 logger.error(f"Topic clustering failed for {course_name!r}: {e}")
                 stats["errors"] += 1
@@ -661,7 +677,18 @@ class KnowledgeOrganizer:
                         concepts_json = concepts_json.split("```")[1]
                         if concepts_json.startswith("json"):
                             concepts_json = concepts_json[4:]
-                    concepts = json.loads(concepts_json)
+                    try:
+                        concepts = json.loads(concepts_json)
+                    except json.JSONDecodeError:
+                        last_brace = concepts_json.rfind("}")
+                        if last_brace > 0:
+                            trimmed = concepts_json[:last_brace + 1]
+                            if not trimmed.startswith("["):
+                                trimmed = "[" + trimmed
+                            trimmed = trimmed + "]"
+                            concepts = json.loads(trimmed)
+                        else:
+                            raise
 
                     for c in concepts:
                         concept_name = c.get("concept", "").strip()

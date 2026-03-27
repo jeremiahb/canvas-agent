@@ -420,6 +420,10 @@ class DocumentIngester:
                     if not href:
                         continue
 
+                    # Skip non-navigable schemes (mailto, javascript, tel, anchors)
+                    if href.startswith(("mailto:", "javascript:", "tel:", "#")):
+                        continue
+
                     # Skip unrendered Handlebars template hrefs
                     if "{{" in href or "}}" in href:
                         logger.debug(f"Skipping unrendered module item href: {href!r}")
@@ -658,7 +662,12 @@ class DocumentIngester:
             else:
                 logger.debug(f"[_scrape_canvas_page] Insufficient text ({len(text)} chars) — skipping storage")
 
-            # Follow embedded external links
+            # Follow embedded links — Canvas-internal and Canvas files only.
+            # Per spec §12 (Boilerplate Suppression), external web pages embedded in
+            # Canvas pages (help links, university admin sites, etc.) are not course
+            # content and must be skipped. Only follow links that resolve to
+            # Canvas-internal URLs, Canvas file downloads, or gated external platforms
+            # (which get flagged for manual upload, not fetched).
             link_els = await self.page.query_selector_all(
                 ".show-content a[href], #wiki_page_show a[href], "
                 ".assignment-description a[href], .discussion-entries a[href], "
@@ -668,9 +677,17 @@ class DocumentIngester:
             for link_el in link_els:
                 href = await link_el.get_attribute("href") or ""
                 link_title = (await link_el.inner_text()).strip() or title
-                if not href or href.startswith("#"):
+                if not href or href.startswith(("#", "mailto:", "javascript:", "tel:")):
                     continue
                 full_url = href if href.startswith("http") else f"{self.base_url}{href}"
+                # Only follow Canvas-internal links or known external platforms from page content.
+                # Generic external web pages are boilerplate (student services, help, etc.).
+                if not full_url.startswith(self.base_url):
+                    parsed_host = urlparse(full_url).netloc.replace("www.", "")
+                    is_external_platform = any(d in parsed_host for d in EXTERNAL_PLATFORMS)
+                    if not is_external_platform:
+                        logger.debug(f"[_scrape_canvas_page] Skipping external link: {full_url}")
+                        continue
                 await self._process_url(
                     full_url, link_title, course_name,
                     source="page_embed", module_name=module_name

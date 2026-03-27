@@ -780,7 +780,8 @@ class PptxExtractor(BaseExtractor):
                 "notes": notes_text,
             }
             slides.append(slide_record)
-            combined = f"Slide {i}: {title}\n{'\n'.join(body_parts)}"
+            body_text = "\n".join(body_parts)
+            combined = f"Slide {i}: {title}\n{body_text}"
             all_text_parts.append(combined)
 
         full_text = "\n\n".join(all_text_parts)
