@@ -551,7 +551,18 @@ class DocumentIngester:
         logger.debug(f"[_scrape_canvas_page] Navigating to: {url}")
         try:
             await self._goto(url)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.0)  # slightly longer for React-heavy Canvas pages
+
+            # Save snapshot so module item visits are visible in debug_snapshots/
+            try:
+                snap_dir = Path(os.environ.get("DATA_DIR", "data")) / "debug_snapshots"
+                snap_dir.mkdir(parents=True, exist_ok=True)
+                safe_label = re.sub(r"[^\w\-]", "_", f"module_item_{title or url.split('/')[-1]}")[:80]
+                (snap_dir / f"{safe_label}.html").write_text(
+                    await self.page.content(), encoding="utf-8", errors="replace"
+                )
+            except Exception as _snap_err:
+                logger.debug(f"[_scrape_canvas_page] Snapshot save failed: {_snap_err}")
 
             # Resolve title from page if not provided
             if not title:
