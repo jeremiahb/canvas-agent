@@ -82,6 +82,7 @@ class CanvasCrawler:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self._pw = None
+        self.kb = None  # Injected by api/main.py before crawl_all() for normalization pass
         self.knowledge: dict = {
             "crawled_at": None,
             "courses": [],
@@ -198,6 +199,105 @@ class CanvasCrawler:
     # ------------------------------------------------------------------ #
     #  Courses                                                             #
     # ------------------------------------------------------------------ #
+
+    async def get_dashboard_signals(self) -> dict:
+        """
+        Capture urgency signals from the Canvas dashboard: To-Do items,
+        Recent Activity feed, and instructor feedback notices.
+
+        Called once before the per-course crawl loop so that cross-course
+        urgency context is available during normalization.
+        """
+        logger.debug("[get_dashboard_signals] Navigating to dashboard")
+        await self._goto(f"{self.base_url}/")
+        await self.page.wait_for_timeout(2500)  # JS-heavy dashboard needs extra time
+
+        signals: dict = {"todo_items": [], "recent_activity": [], "feedback_items": []}
+
+        # ------------------------------------------------------------------
+        # To-Do items (right sidebar)
+        # ------------------------------------------------------------------
+        try:
+            todo_els = await self.page.query_selector_all(
+                "#right-side .to-do-list .to-do-item, "
+                ".todo-list-item, "
+                "[data-testid='todo-item']"
+            )
+            for el in todo_els:
+                try:
+                    title_el = await el.query_selector("a, .item-details-header")
+                    title = (await title_el.inner_text()).strip() if title_el else ""
+                    if not title:
+                        continue
+                    href = await title_el.get_attribute("href") if title_el else ""
+                    url = f"{self.base_url}{href}" if href and href.startswith("/") else href or ""
+                    date_el = await el.query_selector("time, .date-available, .todo-date")
+                    due_text = (await date_el.inner_text()).strip() if date_el else ""
+                    course_el = await el.query_selector(".context-name, .todo-course")
+                    course_name = (await course_el.inner_text()).strip() if course_el else ""
+                    signals["todo_items"].append({
+                        "title": title,
+                        "url": url,
+                        "due_date": due_text,
+                        "course_name": course_name,
+                    })
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"[get_dashboard_signals] To-do parse failed: {e}")
+
+        # ------------------------------------------------------------------
+        # Recent Activity stream
+        # ------------------------------------------------------------------
+        try:
+            activity_els = await self.page.query_selector_all(
+                "#dashboard_activity_stream .stream-item, "
+                ".activity-stream .stream-item, "
+                "[data-testid='activity-item']"
+            )
+            for el in activity_els:
+                try:
+                    title_el = await el.query_selector("a, h3, .title")
+                    title = (await title_el.inner_text()).strip() if title_el else ""
+                    if not title:
+                        continue
+                    href = await title_el.get_attribute("href") if title_el else ""
+                    url = f"{self.base_url}{href}" if href and href.startswith("/") else href or ""
+                    time_el = await el.query_selector("time")
+                    posted = (await time_el.get_attribute("datetime") or "").strip() if time_el else ""
+                    signals["recent_activity"].append({
+                        "title": title,
+                        "url": url,
+                        "posted_at": posted,
+                    })
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"[get_dashboard_signals] Recent activity parse failed: {e}")
+
+        # ------------------------------------------------------------------
+        # Instructor feedback notices (sidebar / cards)
+        # ------------------------------------------------------------------
+        try:
+            feedback_els = await self.page.query_selector_all(
+                ".recent-feedback, .grade-summary, [data-testid='recent-feedback']"
+            )
+            for el in feedback_els:
+                try:
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        signals["feedback_items"].append({"text": text[:500]})
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"[get_dashboard_signals] Feedback parse failed: {e}")
+
+        logger.info(
+            f"[get_dashboard_signals] todo={len(signals['todo_items'])} "
+            f"activity={len(signals['recent_activity'])} "
+            f"feedback={len(signals['feedback_items'])}"
+        )
+        return signals
 
     async def get_courses(self) -> list:
         """Return all active enrolled courses from the Canvas dashboard."""
@@ -471,13 +571,21 @@ class CanvasCrawler:
         mod_els = await self.page.query_selector_all(".context_module")
         logger.debug(f"[get_modules] Found {len(mod_els)} .context_module elements")
         modules = []
-        for mod in mod_els:
+        for mod_idx, mod in enumerate(mod_els):
             try:
                 name_el = await mod.query_selector(".ig-header-title")
                 name = (await name_el.inner_text()).strip() if name_el else "Unnamed Module"
 
+                # Week label: header subtitle or date range visible next to module title
+                week_label_el = await mod.query_selector(".ig-header-subtitle, .module-unlock-at")
+                week_label = (await week_label_el.inner_text()).strip() if week_label_el else ""
+
+                # Lock state: locked modules show a lock icon or locked CSS class
+                lock_el = await mod.query_selector(".locked_icon, .icon-lock, [data-locked='true']")
+                is_locked = lock_el is not None
+
                 items = []
-                for item in await mod.query_selector_all(".context_module_item"):
+                for item_idx, item in enumerate(await mod.query_selector_all(".context_module_item")):
                     link = await item.query_selector("a.title")
                     if link:
                         item_href = await link.get_attribute("href") or ""
@@ -486,13 +594,51 @@ class CanvasCrawler:
                         if "{{" in item_href or "}}" in item_href:
                             logger.debug(f"Skipping unrendered module item href: {item_href!r}")
                             continue
+
+                        # Completion state from row CSS classes
+                        item_classes = await item.get_attribute("class") or ""
+                        if "completed" in item_classes:
+                            completion_state = "completed"
+                        elif "overdue" in item_classes:
+                            completion_state = "overdue"
+                        else:
+                            completion_state = "not_started"
+
+                        # Item type from icon class
+                        icon_el = await item.query_selector("i[class*='icon-'], .item-icon i")
+                        item_type = "unknown"
+                        if icon_el:
+                            icon_class = await icon_el.get_attribute("class") or ""
+                            if "assignment" in icon_class:
+                                item_type = "assignment"
+                            elif "quiz" in icon_class:
+                                item_type = "quiz"
+                            elif "discussion" in icon_class:
+                                item_type = "discussion"
+                            elif "page" in icon_class or "document" in icon_class:
+                                item_type = "page"
+                            elif "file" in icon_class:
+                                item_type = "file"
+                            elif "external" in icon_class or "link" in icon_class:
+                                item_type = "external_url"
+
                         items.append({
                             "title": (await link.inner_text()).strip(),
                             "url": f"{self.base_url}{item_href}" if item_href.startswith("/") else item_href,
+                            "item_type": item_type,
+                            "completion_state": completion_state,
+                            "item_order": item_idx,
                         })
 
-                logger.debug(f"[get_modules] Module: {name!r} — {len(items)} items")
-                modules.append({"name": name, "items": items})
+                logger.debug(f"[get_modules] Module: {name!r} — {len(items)} items locked={is_locked}")
+                modules.append({
+                    "name": name,
+                    "title": name,
+                    "items": items,
+                    "position": mod_idx,
+                    "week_label": week_label,
+                    "is_locked": is_locked,
+                })
 
             except Exception as e:
                 logger.warning(f"Error parsing module: {e}", exc_info=True)
@@ -563,6 +709,654 @@ class CanvasCrawler:
         return ""
 
     # ------------------------------------------------------------------ #
+    #  Dashboard discovery                                                #
+    # ------------------------------------------------------------------ #
+
+    async def crawl_dashboard(self) -> dict:
+        """
+        Crawl the Canvas dashboard for urgency signals:
+        - To Do items (due soon)
+        - Recent activity
+        - Course cards and visible tabs
+        - Recent feedback
+        Returns dict with keys: todo_items, recent_activity, course_cards, recent_feedback
+        """
+        logger.info("[crawl_dashboard] Navigating to Canvas dashboard")
+        await self._goto(f"{self.base_url}")
+        await self.page.wait_for_timeout(2000)
+
+        result: dict = {
+            "todo_items": [],
+            "recent_activity": [],
+            "course_cards": [],
+            "recent_feedback": [],
+        }
+
+        # --- To Do items ---
+        try:
+            todo_els = await self.page.query_selector_all(
+                ".todo-list-header + ul li, .todo-item, .ic-Dashboard__activity"
+            )
+            logger.debug(f"[crawl_dashboard] Found {len(todo_els)} todo elements")
+            for el in todo_els:
+                try:
+                    title_el = await el.query_selector("a, .title, .todo-title")
+                    due_el = await el.query_selector(".date-available, .due-date, time")
+                    course_el = await el.query_selector(".context-name, .course-title, .todo-course")
+                    type_el = await el.query_selector(".type, .todo-type, .badge")
+
+                    title = (await title_el.inner_text()).strip() if title_el else ""
+                    if not title:
+                        continue
+                    due = (await due_el.inner_text()).strip() if due_el else ""
+                    course_name = (await course_el.inner_text()).strip() if course_el else ""
+                    item_type = (await type_el.inner_text()).strip() if type_el else ""
+                    result["todo_items"].append({
+                        "title": title,
+                        "due_date": due,
+                        "course": course_name,
+                        "type": item_type,
+                    })
+                    logger.debug(f"[crawl_dashboard] Todo: {title!r} due={due!r}")
+                except Exception as e:
+                    logger.warning(f"Error parsing todo item: {e}")
+        except Exception as e:
+            logger.warning(f"[crawl_dashboard] Todo extraction failed: {e}")
+
+        # --- Recent Activity ---
+        try:
+            activity_els = await self.page.query_selector_all(
+                ".stream-activity .stream-item, .activity-feed .stream-item"
+            )
+            logger.debug(f"[crawl_dashboard] Found {len(activity_els)} activity items")
+            for el in activity_els:
+                try:
+                    title_el = await el.query_selector("a, .title, h3, h4")
+                    date_el = await el.query_selector("time, .date, .updated-at")
+                    course_el = await el.query_selector(".context-name, .course-title")
+                    summary_el = await el.query_selector(".summary, .preview, p")
+
+                    title = (await title_el.inner_text()).strip() if title_el else ""
+                    if not title:
+                        continue
+                    date = (await date_el.get_attribute("datetime") or await date_el.inner_text()).strip() if date_el else ""
+                    course_name = (await course_el.inner_text()).strip() if course_el else ""
+                    summary = (await summary_el.inner_text()).strip() if summary_el else ""
+                    result["recent_activity"].append({
+                        "title": title,
+                        "date": date,
+                        "course": course_name,
+                        "summary": summary,
+                    })
+                    logger.debug(f"[crawl_dashboard] Activity: {title!r}")
+                except Exception as e:
+                    logger.warning(f"Error parsing activity item: {e}")
+        except Exception as e:
+            logger.warning(f"[crawl_dashboard] Activity extraction failed: {e}")
+
+        # --- Course cards ---
+        try:
+            card_els = await self.page.query_selector_all(".ic-DashboardCard")
+            logger.debug(f"[crawl_dashboard] Found {len(card_els)} dashboard cards")
+            for card in card_els:
+                try:
+                    name_el = await card.query_selector(".ic-DashboardCard__header-title")
+                    link_el = await card.query_selector("a.ic-DashboardCard__link")
+                    course_name = (await name_el.inner_text()).strip() if name_el else ""
+                    course_link = await link_el.get_attribute("href") if link_el else ""
+                    if course_link and course_link.startswith("/"):
+                        course_link = f"{self.base_url}{course_link}"
+
+                    tab_els = await card.query_selector_all(".ic-DashboardCard__action-container a")
+                    tabs = []
+                    for tab in tab_els:
+                        tab_href = await tab.get_attribute("href") or ""
+                        tab_text = (await tab.inner_text()).strip()
+                        if tab_href and tab_text:
+                            tabs.append({"label": tab_text, "url": f"{self.base_url}{tab_href}" if tab_href.startswith("/") else tab_href})
+
+                    result["course_cards"].append({
+                        "name": course_name,
+                        "url": course_link,
+                        "tabs": tabs,
+                    })
+                    logger.debug(f"[crawl_dashboard] Card: {course_name!r} tabs={len(tabs)}")
+                except Exception as e:
+                    logger.warning(f"Error parsing course card: {e}")
+        except Exception as e:
+            logger.warning(f"[crawl_dashboard] Course card extraction failed: {e}")
+
+        # --- Recent Feedback ---
+        try:
+            feedback_els = await self.page.query_selector_all(".recent-feedback, .submission-feedback")
+            logger.debug(f"[crawl_dashboard] Found {len(feedback_els)} feedback items")
+            for el in feedback_els:
+                try:
+                    title_el = await el.query_selector("a, .title, .assignment-title")
+                    grade_el = await el.query_selector(".grade, .score")
+                    comment_el = await el.query_selector(".comment, .feedback-comment, p")
+
+                    title = (await title_el.inner_text()).strip() if title_el else ""
+                    if not title:
+                        continue
+                    grade = (await grade_el.inner_text()).strip() if grade_el else ""
+                    comment = (await comment_el.inner_text()).strip() if comment_el else ""
+                    result["recent_feedback"].append({
+                        "assignment": title,
+                        "grade": grade,
+                        "comment": comment,
+                    })
+                    logger.debug(f"[crawl_dashboard] Feedback: {title!r} grade={grade!r}")
+                except Exception as e:
+                    logger.warning(f"Error parsing feedback item: {e}")
+        except Exception as e:
+            logger.warning(f"[crawl_dashboard] Feedback extraction failed: {e}")
+
+        await self._save_page_snapshot("dashboard_signals")
+        logger.info(
+            f"[crawl_dashboard] Done: {len(result['todo_items'])} todos, "
+            f"{len(result['recent_activity'])} activity items, "
+            f"{len(result['course_cards'])} cards, "
+            f"{len(result['recent_feedback'])} feedback items"
+        )
+        return result
+
+    # ------------------------------------------------------------------ #
+    #  Course navigation discovery                                        #
+    # ------------------------------------------------------------------ #
+
+    async def discover_course_nav(self, course_id: str) -> list[dict]:
+        """
+        Dynamically discover all visible navigation entries for a course.
+        Returns list of {label, url, nav_id} dicts.
+        Canvas navigation varies per course — don't assume fixed items.
+        """
+        logger.debug(f"[discover_course_nav] course_id={course_id}")
+        await self._goto(f"{self.base_url}/courses/{course_id}")
+        await self.page.wait_for_timeout(1500)
+
+        nav_items = []
+        try:
+            nav_els = await self.page.query_selector_all(
+                "#section-tabs a, .nav-item a, .menu-item a"
+            )
+            logger.debug(f"[discover_course_nav] Found {len(nav_els)} nav elements for course {course_id}")
+            seen_hrefs = set()
+            for el in nav_els:
+                try:
+                    href = await el.get_attribute("href") or ""
+                    label = (await el.inner_text()).strip()
+                    nav_id = await el.get_attribute("data-id") or ""
+
+                    if not href or not label:
+                        continue
+                    if href in seen_hrefs:
+                        continue
+                    seen_hrefs.add(href)
+
+                    full_url = f"{self.base_url}{href}" if href.startswith("/") else href
+                    nav_items.append({"label": label, "url": full_url, "nav_id": nav_id})
+                    logger.debug(f"[discover_course_nav] Nav: {label!r} -> {full_url}")
+                except Exception as e:
+                    logger.warning(f"Error parsing nav item: {e}")
+        except Exception as e:
+            logger.warning(f"[discover_course_nav] Nav extraction failed for course {course_id}: {e}")
+
+        logger.info(f"[discover_course_nav] Found {len(nav_items)} nav entries for course {course_id}")
+        return nav_items
+
+    # ------------------------------------------------------------------ #
+    #  Quiz discovery                                                      #
+    # ------------------------------------------------------------------ #
+
+    async def get_quizzes(self, course_id: str) -> list[dict]:
+        """
+        Discover quizzes from the quizzes index page.
+        SAFE MODE: Only captures summary/index data. Never clicks Take Quiz.
+        Returns list of quiz summary dicts.
+        """
+        logger.debug(f"[get_quizzes] course_id={course_id}")
+        await self._goto(f"{self.base_url}/courses/{course_id}/quizzes")
+        await self.page.wait_for_timeout(1500)
+        await self._save_page_snapshot(f"{course_id}_quizzes")
+
+        # SAFETY CHECK: abort if an active quiz attempt is in progress
+        active_attempt = await self.page.query_selector(".quiz-submit, #submit_quiz_form")
+        if active_attempt:
+            logger.warning(f"[SAFETY] Active quiz attempt detected on course {course_id} quizzes page — aborting extraction")
+            return []
+
+        quizzes = []
+        try:
+            quiz_els = await self.page.query_selector_all(
+                ".quiz, .quiz-list .quiz, #assignment-quizzes .quiz"
+            )
+            logger.debug(f"[get_quizzes] Found {len(quiz_els)} quiz elements for course {course_id}")
+
+            for el in quiz_els:
+                try:
+                    # title
+                    title_el = (
+                        await el.query_selector(".quiz-title")
+                        or await el.query_selector("h3")
+                        or await el.query_selector("h4")
+                    )
+                    title = (await title_el.inner_text()).strip() if title_el else ""
+                    if not title:
+                        continue
+
+                    # quiz URL
+                    link_el = await el.query_selector("a")
+                    quiz_url = ""
+                    if link_el:
+                        href = await link_el.get_attribute("href") or ""
+                        quiz_url = f"{self.base_url}{href}" if href.startswith("/") else href
+
+                    # due date
+                    due_el = (
+                        await el.query_selector(".due-date")
+                        or await el.query_selector(".date-available")
+                        or await el.query_selector("[data-due-date]")
+                    )
+                    due_date = ""
+                    if due_el:
+                        due_date = (await due_el.inner_text()).strip()
+
+                    # points
+                    pts_el = (
+                        await el.query_selector(".point-count")
+                        or await el.query_selector(".display_points_possible")
+                    )
+                    point_value = (await pts_el.inner_text()).strip() if pts_el else ""
+
+                    # question count — parse "N Questions" style text
+                    qcount_el = await el.query_selector(".question-count")
+                    question_count = None
+                    if qcount_el:
+                        qcount_text = (await qcount_el.inner_text()).strip()
+                        try:
+                            question_count = int(qcount_text.strip().split()[0])
+                        except Exception:
+                            question_count = None
+
+                    # time limit — parse "N Minutes" style text
+                    time_el = await el.query_selector(".time-limit")
+                    time_limit = ""
+                    if time_el:
+                        time_limit = (await time_el.inner_text()).strip()
+                    is_timed = bool(time_limit)
+
+                    # allowed attempts
+                    attempts_el = await el.query_selector(".allowed-attempts")
+                    allowed_attempts = (await attempts_el.inner_text()).strip() if attempts_el else ""
+
+                    # status
+                    status_el = (
+                        await el.query_selector(".submitted")
+                        or await el.query_selector(".complete")
+                        or await el.query_selector(".not-submitted")
+                    )
+                    status = (await status_el.inner_text()).strip() if status_el else ""
+
+                    quiz = {
+                        "title": title,
+                        "quiz_url": quiz_url,
+                        "due_date": due_date,
+                        "point_value": point_value,
+                        "question_count": question_count,
+                        "time_limit": time_limit,
+                        "is_timed": is_timed,
+                        "allowed_attempts": allowed_attempts,
+                        "status": status,
+                    }
+                    quizzes.append(quiz)
+                    logger.debug(f"[get_quizzes] Quiz: {title!r} timed={is_timed} status={status!r}")
+                except Exception as e:
+                    logger.warning(f"Error parsing quiz element: {e}")
+        except Exception as e:
+            logger.warning(f"[get_quizzes] Quiz extraction failed for course {course_id}: {e}")
+
+        logger.info(f"[get_quizzes] Found {len(quizzes)} quizzes for course {course_id}")
+        return quizzes
+
+    # ------------------------------------------------------------------ #
+    #  Discussion discovery                                               #
+    # ------------------------------------------------------------------ #
+
+    async def get_discussions(self, course_id: str) -> list[dict]:
+        """
+        Discover discussions with state signals: pinned, closed, reply counts, graded status.
+        """
+        logger.debug(f"[get_discussions] course_id={course_id}")
+        await self._goto(f"{self.base_url}/courses/{course_id}/discussion_topics")
+        await self.page.wait_for_timeout(1500)
+        await self._save_page_snapshot(f"{course_id}_discussions")
+
+        discussions = []
+        try:
+            disc_els = await self.page.query_selector_all(
+                ".discussion-list .discussion, .discussion-topic"
+            )
+            logger.debug(f"[get_discussions] Found {len(disc_els)} discussion elements for course {course_id}")
+
+            for el in disc_els:
+                try:
+                    # title and url
+                    title_el = (
+                        await el.query_selector(".discussion-title a")
+                        or await el.query_selector("h3 a")
+                    )
+                    title = (await title_el.inner_text()).strip() if title_el else ""
+                    if not title:
+                        continue
+                    href = await title_el.get_attribute("href") if title_el else ""
+                    url = f"{self.base_url}{href}" if href and href.startswith("/") else href or ""
+
+                    # pinned
+                    pinned_el = (
+                        await el.query_selector(".pinned")
+                        or await el.query_selector("[data-pinned='true']")
+                    )
+                    is_pinned = pinned_el is not None
+
+                    # closed / locked
+                    closed_el = (
+                        await el.query_selector(".locked")
+                        or await el.query_selector(".closed")
+                        or await el.query_selector("[data-closed='true']")
+                    )
+                    is_closed = closed_el is not None
+
+                    # reply count
+                    reply_el = (
+                        await el.query_selector(".total-items")
+                        or await el.query_selector(".reply-count")
+                    )
+                    reply_count = 0
+                    if reply_el:
+                        try:
+                            reply_count = int((await reply_el.inner_text()).strip().split()[0])
+                        except Exception:
+                            reply_count = 0
+
+                    # unread count
+                    unread_el = await el.query_selector(".unread-items")
+                    unread_count = 0
+                    if unread_el:
+                        try:
+                            unread_count = int((await unread_el.inner_text()).strip().split()[0])
+                        except Exception:
+                            unread_count = 0
+
+                    # graded
+                    graded_el = (
+                        await el.query_selector(".discussion-points-possible")
+                        or await el.query_selector("[data-assignment-id]")
+                    )
+                    is_graded = graded_el is not None
+
+                    # due date (only meaningful if graded)
+                    due_el = await el.query_selector(".due-date")
+                    due_date = (await due_el.inner_text()).strip() if due_el else ""
+
+                    # points possible
+                    pts_el = await el.query_selector(".points_possible")
+                    point_value = (await pts_el.inner_text()).strip() if pts_el else ""
+
+                    # last reply date
+                    last_reply_el = await el.query_selector(".last-reply-at")
+                    last_reply_date = (await last_reply_el.inner_text()).strip() if last_reply_el else ""
+
+                    discussion = {
+                        "title": title,
+                        "url": url,
+                        "is_pinned": is_pinned,
+                        "is_closed": is_closed,
+                        "reply_count": reply_count,
+                        "unread_count": unread_count,
+                        "is_graded": is_graded,
+                        "due_date": due_date,
+                        "point_value": point_value,
+                        "last_reply_date": last_reply_date,
+                    }
+                    discussions.append(discussion)
+                    logger.debug(f"[get_discussions] Discussion: {title!r} graded={is_graded} replies={reply_count}")
+                except Exception as e:
+                    logger.warning(f"Error parsing discussion element: {e}")
+        except Exception as e:
+            logger.warning(f"[get_discussions] Discussion extraction failed for course {course_id}: {e}")
+
+        logger.info(f"[get_discussions] Found {len(discussions)} discussions for course {course_id}")
+        return discussions
+
+    # ------------------------------------------------------------------ #
+    #  Calendar discovery                                                 #
+    # ------------------------------------------------------------------ #
+
+    async def get_calendar_events(self, course_ids: list[str]) -> list[dict]:
+        """
+        Capture calendar events spanning all enrolled courses.
+        Captures dated and undated items.
+        Uses the Canvas calendar page.
+        """
+        logger.info(f"[get_calendar_events] Navigating to calendar (course_ids={course_ids})")
+        await self._goto(f"{self.base_url}/calendar")
+        await self.page.wait_for_timeout(2000)
+        await self._save_page_snapshot("calendar")
+
+        all_events: list[dict] = []
+
+        # --- Dated events ---
+        try:
+            event_els = await self.page.query_selector_all(
+                ".fc-event, .calendar-event, .event-item"
+            )
+            logger.debug(f"[get_calendar_events] Found {len(event_els)} dated event elements")
+            for el in event_els:
+                try:
+                    title_el = (
+                        await el.query_selector(".fc-title")
+                        or await el.query_selector(".event-title")
+                    )
+                    title = ""
+                    if title_el:
+                        title = (await title_el.inner_text()).strip()
+                    if not title:
+                        title = (await el.inner_text()).strip()
+                    if not title:
+                        continue
+
+                    # date — try data attribute, then title attribute, then text
+                    date = await el.get_attribute("data-date") or ""
+                    if not date:
+                        date = await el.get_attribute("title") or ""
+
+                    # event type from icon/class
+                    class_attr = await el.get_attribute("class") or ""
+                    event_type = "event"
+                    if "assignment" in class_attr:
+                        event_type = "assignment"
+                    elif "quiz" in class_attr:
+                        event_type = "quiz"
+                    elif "discussion" in class_attr:
+                        event_type = "discussion"
+
+                    # event url
+                    link_el = await el.query_selector("a")
+                    event_url = ""
+                    if link_el:
+                        href = await link_el.get_attribute("href") or ""
+                        event_url = f"{self.base_url}{href}" if href.startswith("/") else href
+
+                    # course id — try data attribute
+                    course_id = await el.get_attribute("data-course-id") or ""
+
+                    all_events.append({
+                        "title": title,
+                        "date": date,
+                        "course_id": course_id,
+                        "event_url": event_url,
+                        "event_type": event_type,
+                        "is_undated": False,
+                    })
+                    logger.debug(f"[get_calendar_events] Event: {title!r} date={date!r} type={event_type}")
+                except Exception as e:
+                    logger.warning(f"Error parsing calendar event: {e}")
+        except Exception as e:
+            logger.warning(f"[get_calendar_events] Dated event extraction failed: {e}")
+
+        # --- Undated events ---
+        try:
+            await self._goto(f"{self.base_url}/calendar#view_name=undated")
+            await self.page.wait_for_timeout(2000)
+
+            undated_els = await self.page.query_selector_all(
+                ".fc-event, .calendar-event, .event-item"
+            )
+            logger.debug(f"[get_calendar_events] Found {len(undated_els)} undated event elements")
+            for el in undated_els:
+                try:
+                    title_el = (
+                        await el.query_selector(".fc-title")
+                        or await el.query_selector(".event-title")
+                    )
+                    title = ""
+                    if title_el:
+                        title = (await title_el.inner_text()).strip()
+                    if not title:
+                        title = (await el.inner_text()).strip()
+                    if not title:
+                        continue
+
+                    class_attr = await el.get_attribute("class") or ""
+                    event_type = "event"
+                    if "assignment" in class_attr:
+                        event_type = "assignment"
+                    elif "quiz" in class_attr:
+                        event_type = "quiz"
+                    elif "discussion" in class_attr:
+                        event_type = "discussion"
+
+                    link_el = await el.query_selector("a")
+                    event_url = ""
+                    if link_el:
+                        href = await link_el.get_attribute("href") or ""
+                        event_url = f"{self.base_url}{href}" if href.startswith("/") else href
+
+                    course_id = await el.get_attribute("data-course-id") or ""
+
+                    all_events.append({
+                        "title": title,
+                        "date": "",
+                        "course_id": course_id,
+                        "event_url": event_url,
+                        "event_type": event_type,
+                        "is_undated": True,
+                    })
+                    logger.debug(f"[get_calendar_events] Undated event: {title!r} type={event_type}")
+                except Exception as e:
+                    logger.warning(f"Error parsing undated calendar event: {e}")
+        except Exception as e:
+            logger.warning(f"[get_calendar_events] Undated event extraction failed: {e}")
+
+        logger.info(f"[get_calendar_events] Total events captured: {len(all_events)}")
+        return all_events
+
+    # ------------------------------------------------------------------ #
+    #  Safe quiz detail                                                   #
+    # ------------------------------------------------------------------ #
+
+    async def get_quiz_details(self, quiz_url: str, course_id: str) -> dict:
+        """
+        Navigate to a quiz summary/detail page ONLY.
+        SAFETY: If we detect an active attempt page, abort immediately.
+        Returns quiz detail dict or empty dict if unsafe.
+        """
+        logger.debug(f"[get_quiz_details] Navigating to {quiz_url} (course_id={course_id})")
+        await self._goto(quiz_url)
+        await self.page.wait_for_timeout(1500)
+
+        # SAFETY CHECK — abort immediately if an active quiz attempt is detected
+        active_form = await self.page.query_selector(
+            "#submit_quiz_form, .quiz-submit-button, .question-body form[action*='submission']"
+        )
+        if active_form:
+            logger.warning(f"[SAFETY] Active quiz attempt detected at {quiz_url} — aborting")
+            return {"is_restricted": True, "url": quiz_url}
+
+        details: dict = {
+            "url": quiz_url,
+            "course_id": course_id,
+            "is_restricted": False,
+            "instructions": "",
+            "time_limit": "",
+            "allowed_attempts": "",
+            "due_date": "",
+            "available_from": "",
+            "available_until": "",
+            "take_quiz_link": "",
+            "proctoring_notice": False,
+        }
+
+        try:
+            # instructions
+            instr_el = (
+                await self.page.query_selector(".description.user_content")
+                or await self.page.query_selector(".quiz-instructions")
+            )
+            if instr_el:
+                details["instructions"] = (await instr_el.inner_text()).strip()
+                logger.debug(f"[get_quiz_details] Instructions: {len(details['instructions'])} chars")
+
+            # time limit
+            tl_el = await self.page.query_selector(".time-limit-minutes")
+            if tl_el:
+                details["time_limit"] = (await tl_el.inner_text()).strip()
+
+            # allowed attempts
+            att_el = await self.page.query_selector(".allowed-attempts")
+            if att_el:
+                details["allowed_attempts"] = (await att_el.inner_text()).strip()
+
+            # due date
+            due_el = await self.page.query_selector(".due-date")
+            if due_el:
+                details["due_date"] = (await due_el.inner_text()).strip()
+
+            # available from / until
+            avail_els = await self.page.query_selector_all(".available-date")
+            if len(avail_els) >= 1:
+                details["available_from"] = (await avail_els[0].inner_text()).strip()
+            if len(avail_els) >= 2:
+                details["available_until"] = (await avail_els[1].inner_text()).strip()
+
+            # take quiz link — capture href but do NOT click
+            take_el = await self.page.query_selector("a.btn-primary[href*='quiz'], a[href*='take_quiz']")
+            if not take_el:
+                # secondary: look for any link with "Take" in text
+                all_links = await self.page.query_selector_all("a")
+                for lnk in all_links:
+                    txt = (await lnk.inner_text()).strip().lower()
+                    if "take" in txt and "quiz" in txt:
+                        take_el = lnk
+                        break
+            if take_el:
+                href = await take_el.get_attribute("href") or ""
+                details["take_quiz_link"] = f"{self.base_url}{href}" if href.startswith("/") else href
+                logger.debug(f"[get_quiz_details] Take quiz link found: {details['take_quiz_link']!r} (NOT clicked)")
+
+            # proctoring notice
+            instr_text = details["instructions"].lower()
+            proctoring_keywords = ["respondus", "lockdown browser", "proctored", "proctoring"]
+            details["proctoring_notice"] = any(kw in instr_text for kw in proctoring_keywords)
+
+            logger.info(f"[get_quiz_details] Details captured for {quiz_url}: proctored={details['proctoring_notice']}")
+        except Exception as e:
+            logger.warning(f"[get_quiz_details] Error extracting quiz details from {quiz_url}: {e}", exc_info=True)
+
+        return details
+
+    # ------------------------------------------------------------------ #
     #  Page snapshot saving                                               #
     # ------------------------------------------------------------------ #
 
@@ -599,6 +1393,14 @@ class CanvasCrawler:
         logger.info("[START] Full Canvas crawl")
         self.knowledge["crawled_at"] = datetime.now().isoformat()
         self.knowledge["courses"] = []
+
+        # Capture dashboard urgency signals first (To-Do, Recent Activity, feedback)
+        logger.debug("[crawl_all] Capturing dashboard signals")
+        try:
+            self.knowledge["dashboard"] = await self.get_dashboard_signals()
+        except Exception as e:
+            logger.warning(f"[crawl_all] Dashboard signals failed: {e}")
+            self.knowledge["dashboard"] = {}
 
         logger.debug("[crawl_all] Fetching course list from dashboard")
         courses = await self.get_courses()
@@ -664,6 +1466,22 @@ class CanvasCrawler:
 
             course["assignments"] = assignments
 
+            logger.debug(f"[crawl_all] Fetching discussions for {course['name']}")
+            try:
+                course["discussions"] = await self.get_discussions(cid)
+                logger.info(f"  Found {len(course['discussions'])} discussions")
+            except Exception as e:
+                logger.warning(f"[crawl_all] Discussions failed for {course['name']}: {e}")
+                course["discussions"] = []
+
+            logger.debug(f"[crawl_all] Fetching quizzes for {course['name']}")
+            try:
+                course["quizzes"] = await self.get_quizzes(cid)
+                logger.info(f"  Found {len(course['quizzes'])} quizzes")
+            except Exception as e:
+                logger.warning(f"[crawl_all] Quizzes failed for {course['name']}: {e}")
+                course["quizzes"] = []
+
             # RF-Ingester-bypass: pass _polite_goto so the ingester uses
             # the same rate-limiting behaviour as the crawler.
             logger.info(f"  Ingesting documents for: {course['name']}")
@@ -686,7 +1504,100 @@ class CanvasCrawler:
 
         logger.info(f"[DONE] Crawl complete -- {len(courses)} courses indexed")  # RF-24
         logger.debug(f"[crawl_all] Knowledge snapshot: {len(self.knowledge['courses'])} courses stored")
+
+        # ------------------------------------------------------------------
+        # Post-crawl: normalize → detect changes → store CanvasObjects → build graph
+        # This runs in-process after all courses are scraped so it doesn't
+        # interrupt the browser session.
+        # ------------------------------------------------------------------
+        if self.kb:
+            try:
+                await self._run_normalization_pass()
+            except Exception as e:
+                logger.error(f"[crawl_all] Normalization pass failed: {e}", exc_info=True)
+
         return self.knowledge
+
+    async def _run_normalization_pass(self) -> None:
+        """
+        Convert all crawled dicts to CanvasObjects, detect changes, store in
+        ChromaDB, and build the knowledge graph.
+
+        Requires self.kb to be set (injected by api/main.py before crawl_all()).
+        """
+        from agent.canvas_normalizer import CanvasNormalizer
+        from agent.graph_builder import GraphBuilder
+        from agent.change_detector import ChangeDetector
+
+        normalizer = CanvasNormalizer()
+        graph_builder = GraphBuilder()
+        detector = ChangeDetector()
+
+        all_objects = []
+
+        # Normalize dashboard signals
+        dashboard = self.knowledge.get("dashboard", {})
+        for todo_raw in dashboard.get("todo_items", []):
+            try:
+                all_objects.append(normalizer.normalize_dashboard_todo(todo_raw))
+            except Exception:
+                pass
+
+        # Normalize per-course objects
+        for course in self.knowledge.get("courses", []):
+            try:
+                course_objects = normalizer.normalize_course(course)
+                all_objects.extend(course_objects)
+            except Exception as e:
+                logger.warning(f"[normalization] Failed for {course.get('name','?')}: {e}")
+
+        # Change detection + upsert
+        changes = detector.detect_batch(all_objects, self.kb)
+        for obj in all_objects:
+            try:
+                self.kb.upsert_canvas_object(obj)
+            except Exception as e:
+                logger.warning(f"[normalization] upsert failed {obj.id}: {e}")
+
+        # Store change records (as JSON in a simple collection)
+        for chg in changes:
+            try:
+                import dataclasses
+                import hashlib as _hs
+                chg_dict = dataclasses.asdict(chg)
+                chg_id = chg.change_id
+                # Store as plain JSON in course_content collection
+                self.kb.course_content.upsert(
+                    ids=[chg_id],
+                    documents=[f"Change: {chg.change_type} on {chg.object_id}"],
+                    metadatas=[{
+                        "type": "change_record",
+                        "course_id": chg.course_id,
+                        "object_id": chg.object_id,
+                        "change_type": chg.change_type,
+                        "change_severity": chg.change_severity,
+                        "restudy_flag": chg.restudy_flag,
+                        "replan_flag": chg.replan_flag,
+                        "detected_at": chg.detected_at,
+                    }],
+                )
+            except Exception as e:
+                logger.warning(f"[normalization] change record store failed: {e}")
+
+        # Build and store graph edges
+        try:
+            edges = graph_builder.build_from_objects(all_objects)
+            for edge in edges:
+                try:
+                    self.kb.upsert_graph_edge(edge)
+                except Exception as e:
+                    logger.warning(f"[graph] Edge upsert failed {edge.edge_id}: {e}")
+            logger.info(
+                f"[normalization] {len(all_objects)} objects, "
+                f"{len(changes)} change(s), {len(edges)} edges stored"
+            )
+        except Exception as e:
+            logger.error(f"[graph] build_from_objects failed: {e}", exc_info=True)
 
     async def save_knowledge(self, path: str = "") -> None:
         """Persist the crawl snapshot to disk."""

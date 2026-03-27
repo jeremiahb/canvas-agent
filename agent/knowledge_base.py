@@ -132,6 +132,9 @@ class KnowledgeBase:
         self.topics = self._get_or_create("topics")
         self.concepts = self._get_or_create("concepts")
         self.chat_history = self._get_or_create("chat_history")
+        # Canonical CanvasObject store + knowledge graph
+        self.canvas_objects = self._get_or_create("canvas_objects")
+        self.graph_edges = self._get_or_create("graph_edges")
 
     def _get_or_create(self, name: str):
         return self.client.get_or_create_collection(
@@ -708,6 +711,8 @@ class KnowledgeBase:
             "topics": self.topics.count(),
             "concepts": self.concepts.count(),
             "chat_history": self.chat_history.count(),
+            "canvas_objects": self.canvas_objects.count(),
+            "graph_edges": self.graph_edges.count(),
         }
 
     # ------------------------------------------------------------------ #
@@ -971,3 +976,226 @@ class KnowledgeBase:
         except Exception as e:
             logger.debug(f"[kb.find_by_canonical_url] {e}")
         return None
+
+    # ------------------------------------------------------------------ #
+    #  CanvasObject store (canonical normalized objects from crawler)      #
+    # ------------------------------------------------------------------ #
+
+    def upsert_canvas_object(self, obj) -> None:
+        """
+        Persist a CanvasObject to ChromaDB.
+
+        The main_content field is stored as the document text (for vector
+        search). All other serializable fields go into metadata. Complex
+        nested fields (lists / dicts) are JSON-serialized so ChromaDB can
+        store them as strings.
+        """
+        from agent.canvas_schema import canvas_object_to_dict
+
+        d = canvas_object_to_dict(obj)
+        obj_id = d.pop("id")
+
+        # Use main_content as the searchable document; cap at 8000 chars
+        doc_text = (d.pop("main_content", "") or "")[:8000]
+        if not doc_text:
+            doc_text = d.get("title", "") or obj_id
+
+        # raw_html can be up to 100 KB — strip it from metadata to keep ChromaDB fast
+        d.pop("raw_html", None)
+
+        # ChromaDB metadata must be flat scalars — JSON-encode any list/dict
+        meta: dict = {}
+        for k, v in d.items():
+            if isinstance(v, (list, dict)):
+                meta[k] = json.dumps(v)
+            elif v is None:
+                meta[k] = ""
+            else:
+                meta[k] = v
+
+        self.canvas_objects.upsert(ids=[obj_id], documents=[doc_text], metadatas=[meta])
+        logger.debug(f"[kb.upsert_canvas_object] {obj_id} type={meta.get('object_type','?')}")
+
+    def get_canvas_object(self, obj_id: str):
+        """Fetch a single CanvasObject by ID, or None if not found."""
+        from agent.canvas_schema import canvas_object_from_dict
+
+        try:
+            r = self.canvas_objects.get(ids=[obj_id], include=["documents", "metadatas"])
+            if not r.get("ids"):
+                return None
+            meta = r["metadatas"][0]
+            # Decode any JSON-encoded list/dict fields
+            decoded = {}
+            for k, v in meta.items():
+                if isinstance(v, str) and v.startswith(("[", "{")):
+                    try:
+                        decoded[k] = json.loads(v)
+                    except Exception:
+                        decoded[k] = v
+                else:
+                    decoded[k] = v
+            decoded["id"] = r["ids"][0]
+            decoded["main_content"] = r["documents"][0] if r.get("documents") else ""
+            return canvas_object_from_dict(decoded)
+        except Exception as e:
+            logger.error(f"[kb.get_canvas_object] {obj_id}: {e}")
+            return None
+
+    def get_objects_by_course(self, course_id: str, object_type: str = "") -> list:
+        """Return all CanvasObjects for a course, optionally filtered by type.
+        Pass course_id="" to fetch across all courses."""
+        from agent.canvas_schema import canvas_object_from_dict
+
+        try:
+            count = self.canvas_objects.count()
+            if count == 0:
+                return []
+            if course_id and object_type:
+                where = {"$and": [{"course_id": course_id}, {"object_type": object_type}]}
+            elif course_id:
+                where = {"course_id": course_id}
+            elif object_type:
+                where = {"object_type": object_type}
+            else:
+                where = None  # No filter — return all
+            kwargs: dict = {"include": ["documents", "metadatas"]}
+            if where:
+                kwargs["where"] = where
+            r = self.canvas_objects.get(**kwargs)
+            results = []
+            for i, oid in enumerate(r.get("ids") or []):
+                meta = r["metadatas"][i]
+                decoded = {}
+                for k, v in meta.items():
+                    if isinstance(v, str) and v.startswith(("[", "{")):
+                        try:
+                            decoded[k] = json.loads(v)
+                        except Exception:
+                            decoded[k] = v
+                    else:
+                        decoded[k] = v
+                decoded["id"] = oid
+                decoded["main_content"] = (r["documents"] or [""])[i]
+                try:
+                    results.append(canvas_object_from_dict(decoded))
+                except Exception:
+                    pass
+            return results
+        except Exception as e:
+            logger.error(f"[kb.get_objects_by_course] {course_id}: {e}")
+            return []
+
+    def search_canvas_objects(self, query: str, course_id: str = "",
+                              object_type: str = "", n: int = 10) -> list:
+        """Vector search over CanvasObjects."""
+        count = self.canvas_objects.count()
+        if count == 0:
+            return []
+        filters = []
+        if course_id:
+            filters.append({"course_id": course_id})
+        if object_type:
+            filters.append({"object_type": object_type})
+        kwargs: dict = {"query_texts": [query], "n_results": min(n, count)}
+        if len(filters) == 2:
+            kwargs["where"] = {"$and": filters}
+        elif len(filters) == 1:
+            kwargs["where"] = filters[0]
+        try:
+            return self._format_results(self.canvas_objects.query(**kwargs))
+        except Exception as e:
+            logger.error(f"[kb.search_canvas_objects] {e}")
+            return []
+
+    # ------------------------------------------------------------------ #
+    #  Graph edge store                                                    #
+    # ------------------------------------------------------------------ #
+
+    def upsert_graph_edge(self, edge) -> None:
+        """Persist a GraphEdge to ChromaDB."""
+        from agent.canvas_schema import GraphEdge
+        import dataclasses
+
+        d = dataclasses.asdict(edge)
+        edge_id = d.pop("edge_id")
+        doc_text = f"{d.get('relation_type','')} {d.get('from_id','')} -> {d.get('to_id','')}"
+        meta: dict = {}
+        for k, v in d.items():
+            if isinstance(v, list):
+                meta[k] = json.dumps(v)
+            elif v is None:
+                meta[k] = ""
+            else:
+                meta[k] = v
+        self.graph_edges.upsert(ids=[edge_id], documents=[doc_text], metadatas=[meta])
+
+    def get_edges_for_object(self, obj_id: str) -> list:
+        """Return all GraphEdges where from_id or to_id matches obj_id."""
+        results = []
+        for field_name in ("from_id", "to_id"):
+            try:
+                r = self.graph_edges.get(
+                    where={field_name: obj_id},
+                    include=["documents", "metadatas"],
+                )
+                for i, eid in enumerate(r.get("ids") or []):
+                    meta = dict(r["metadatas"][i])
+                    meta["edge_id"] = eid
+                    if isinstance(meta.get("evidence"), str):
+                        try:
+                            meta["evidence"] = json.loads(meta["evidence"])
+                        except Exception:
+                            pass
+                    results.append(meta)
+            except Exception as e:
+                logger.debug(f"[kb.get_edges_for_object] {field_name}={obj_id}: {e}")
+        return results
+
+    def get_edges_by_relation(self, relation_type: str, from_id: str = "") -> list:
+        """Return edges filtered by relation_type and optionally from_id."""
+        try:
+            count = self.graph_edges.count()
+            if count == 0:
+                return []
+            if from_id:
+                where = {"$and": [{"relation_type": relation_type}, {"from_id": from_id}]}
+            else:
+                where = {"relation_type": relation_type}
+            r = self.graph_edges.get(where=where, include=["documents", "metadatas"])
+            results = []
+            for i, eid in enumerate(r.get("ids") or []):
+                meta = dict(r["metadatas"][i])
+                meta["edge_id"] = eid
+                if isinstance(meta.get("evidence"), str):
+                    try:
+                        meta["evidence"] = json.loads(meta["evidence"])
+                    except Exception:
+                        pass
+                results.append(meta)
+            return results
+        except Exception as e:
+            logger.error(f"[kb.get_edges_by_relation] {e}")
+            return []
+
+    def get_change_records(self, course_id: str = "", limit: int = 50) -> list:
+        """Return ChangeRecord dicts from course_content, newest first."""
+        try:
+            where: dict = {"type": "change_record"}
+            if course_id:
+                where["course_id"] = course_id
+            result = self.course_content.get(
+                where=where,
+                include=["documents", "metadatas"],
+            )
+            records = []
+            for i, meta in enumerate(result.get("metadatas") or []):
+                row = dict(meta)
+                row["change_id"] = (result.get("ids") or [])[i] if result.get("ids") else ""
+                records.append(row)
+            # Sort by detected_at descending
+            records.sort(key=lambda r: r.get("detected_at", ""), reverse=True)
+            return records[:limit]
+        except Exception as e:
+            logger.error(f"[kb.get_change_records] {e}")
+            return []

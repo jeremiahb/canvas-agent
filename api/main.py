@@ -374,6 +374,7 @@ async def run_crawl_task() -> None:
                 return
 
             logger.debug(f"[crawl_task] Session OK — starting crawl (timeout={CRAWL_TIMEOUT_SECONDS}s)")
+            crawler.kb = kb  # Inject KB so normalization pass can store CanvasObjects
             # RF-CrawlTimeout: a hard ceiling prevents an infinitely stalled crawl
             # from holding the running lock forever. 2 hours is generous for any
             # realistic Canvas course load.
@@ -417,11 +418,13 @@ async def run_crawl_task() -> None:
                 "message": f"Crawl complete -- {count} documents indexed. Knowledge pipeline running in background.",
                 "stats": kb.stats(),
             }
-            logger.info("Crawl complete — launching knowledge pipeline")
-
             # Fire-and-forget: generate notes + organize knowledge after every crawl
             global _pipeline_task
-            _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
+            if _pipeline_task is None or _pipeline_task.done():
+                logger.info("Crawl complete — launching knowledge pipeline")
+                _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
+            else:
+                logger.info("Crawl complete — pipeline already running, skipping auto-trigger")
 
     except Exception as e:
         logger.error(f"Crawl error: {e}", exc_info=True)
@@ -703,7 +706,8 @@ async def upload_document_text(body: ManualDocument):
     logger.debug(f"[POST /api/documents/upload] Stored with id={doc_id!r}")
     brain.invalidate_upcoming_cache()
     global _pipeline_task
-    _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
+    if _pipeline_task is None or _pipeline_task.done():
+        _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
     return {
         "message": f"Document '{body.title}' added to knowledge base",
         "doc_id": doc_id,
@@ -749,7 +753,8 @@ async def upload_document_file(
     logger.debug(f"[POST /api/documents/upload-file] Stored with id={doc_id!r}")
     brain.invalidate_upcoming_cache()
     global _pipeline_task
-    _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
+    if _pipeline_task is None or _pipeline_task.done():
+        _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
     return {
         "message": f"'{doc_title}' ingested ({len(text):,} characters extracted)",
         "doc_id": doc_id,
@@ -793,9 +798,12 @@ async def search_notes(body: ChatMessage):
 
 
 @app.post("/api/notes/generate")
-async def trigger_note_generation(background_tasks: BackgroundTasks):
+async def trigger_note_generation():
     """Manually trigger the full knowledge pipeline for all unprocessed documents."""
-    background_tasks.add_task(organizer.run_full_pipeline)
+    if _pipeline_task and not _pipeline_task.done():
+        raise HTTPException(409, "Pipeline already running")
+    global _pipeline_task
+    _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
     return {"message": "Knowledge pipeline started in background"}
 
 
@@ -812,6 +820,7 @@ async def notes_stats():
         "processed_source_docs": len(processed_ids),
         "total_assignments": kb.assignments.count(),
         "total_documents": kb.documents.count(),
+        "pipeline_running": _pipeline_task is not None and not _pipeline_task.done(),
     }
 
 
@@ -988,6 +997,165 @@ async def get_snapshot(name: str):
     if not snap_path.exists():
         raise HTTPException(404, "Snapshot not found")
     return HTMLResponse(content=snap_path.read_text(encoding="utf-8", errors="replace"))
+
+
+# ------------------------------------------------------------------ #
+#  Canvas Objects, Graph, Changes, Study Guide                        #
+# ------------------------------------------------------------------ #
+
+
+@app.get("/api/objects")
+async def get_canvas_objects(course_id: str = "", type: str = ""):
+    """Return CanvasObjects filtered by course_id and/or object type."""
+    try:
+        from agent.canvas_schema import canvas_object_to_dict
+        objects = kb.get_objects_by_course(course_id, object_type=type)
+        results = [canvas_object_to_dict(o) for o in objects]
+        return {"objects": results, "count": len(results)}
+    except Exception as e:
+        logger.error(f"[GET /api/objects] {e}", exc_info=True)
+        raise HTTPException(500, "Failed to fetch canvas objects")
+
+
+@app.get("/api/objects/{obj_id}")
+async def get_canvas_object(obj_id: str):
+    """Return a single CanvasObject with its graph edges."""
+    try:
+        from agent.canvas_schema import canvas_object_to_dict
+        obj = kb.get_canvas_object(obj_id)
+        if obj is None:
+            raise HTTPException(404, "Object not found")
+        edges = kb.get_edges_for_object(obj_id)
+        return {"object": canvas_object_to_dict(obj), "edges": edges}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[GET /api/objects/{obj_id}] {e}", exc_info=True)
+        raise HTTPException(500, "Failed to fetch canvas object")
+
+
+@app.get("/api/graph")
+async def get_graph_edges(from_id: str = "", relation_type: str = ""):
+    """Return graph edges filtered by from_id and/or relation_type."""
+    try:
+        if relation_type:
+            edges = kb.get_edges_by_relation(relation_type, from_id=from_id)
+        elif from_id:
+            edges = kb.get_edges_for_object(from_id)
+        else:
+            # Return a sample — full graph dump is not useful without filters
+            edges = kb.get_edges_by_relation("", from_id="")
+        return {"edges": edges, "count": len(edges)}
+    except Exception as e:
+        logger.error(f"[GET /api/graph] {e}", exc_info=True)
+        raise HTTPException(500, "Failed to fetch graph edges")
+
+
+@app.get("/api/changes")
+async def get_change_records(course_id: str = "", severity: str = ""):
+    """Return recent ChangeRecords, optionally filtered by course_id and severity."""
+    try:
+        records = kb.get_change_records(course_id=course_id, limit=100)
+        if severity:
+            records = [r for r in records if r.get("change_severity") == severity]
+        return {"changes": records, "count": len(records)}
+    except Exception as e:
+        logger.error(f"[GET /api/changes] {e}", exc_info=True)
+        raise HTTPException(500, "Failed to fetch change records")
+
+
+@app.get("/api/study-guide")
+async def get_study_guide(course_id: str = ""):
+    """
+    Return a weekly study guide: due-soon items + recent announcements + priority list.
+    Sorted by urgency_score descending.
+    """
+    try:
+        from agent.knowledge_organizer import _compute_scores
+        from agent.canvas_schema import ObjectType
+        import datetime as _dt
+        now = _dt.datetime.now(tz=_dt.timezone.utc)
+
+        # Collect assignments and quizzes with due dates
+        actionable_types = [
+            ObjectType.ASSIGNMENT.value,
+            ObjectType.QUIZ_SUMMARY.value,
+            ObjectType.DISCUSSION.value,
+        ]
+        items = []
+        for obj_type in actionable_types:
+            objects = kb.get_objects_by_course(course_id, object_type=obj_type)
+            items.extend(objects)
+
+        # Recent announcements (last 30 days)
+        announcements = kb.get_objects_by_course(course_id, object_type=ObjectType.ANNOUNCEMENT.value)
+        items.extend(announcements)
+
+        # Attach scores and sort (items are already CanvasObject instances)
+        scored = []
+        for obj in items:
+            scores = _compute_scores(obj, now=now)
+            scored.append({
+                "id": obj.id,
+                "title": obj.title,
+                "object_type": obj.object_type,
+                "course_id": obj.course_id,
+                "due_date": obj.due_date,
+                "point_value": obj.point_value,
+                "submission_state": obj.submission_state,
+                **scores,
+            })
+
+        scored.sort(key=lambda x: x.get("urgency_score", 0), reverse=True)
+        return {"study_guide": scored, "count": len(scored), "generated_at": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"[GET /api/study-guide] {e}", exc_info=True)
+        raise HTTPException(500, "Failed to generate study guide")
+
+
+@app.get("/api/next-actions")
+async def get_next_actions():
+    """
+    Cross-course priority list sorted by urgency_score descending.
+    Returns top 20 items needing student attention.
+    """
+    try:
+        from agent.knowledge_organizer import _compute_scores
+        from agent.canvas_schema import ObjectType
+        import datetime as _dt
+        now = _dt.datetime.now(tz=_dt.timezone.utc)
+
+        actionable_types = [
+            ObjectType.ASSIGNMENT.value,
+            ObjectType.QUIZ_SUMMARY.value,
+            ObjectType.DISCUSSION.value,
+            ObjectType.ANNOUNCEMENT.value,
+        ]
+        all_items = []
+        for obj_type in actionable_types:
+            all_items.extend(kb.get_objects_by_course("", object_type=obj_type))
+
+        scored = []
+        for obj in all_items:
+            scores = _compute_scores(obj, now=now)
+            urgency = scores.get("urgency_score", 0)
+            if urgency < 0.3:
+                continue  # Skip low-urgency items
+            scored.append({
+                "id": obj.id,
+                "title": obj.title,
+                "object_type": obj.object_type,
+                "course_id": obj.course_id,
+                "due_date": obj.due_date,
+                "point_value": obj.point_value,
+                **scores,
+            })
+
+        scored.sort(key=lambda x: x.get("urgency_score", 0), reverse=True)
+        return {"next_actions": scored[:20], "total_flagged": len(scored)}
+    except Exception as e:
+        logger.error(f"[GET /api/next-actions] {e}", exc_info=True)
+        raise HTTPException(500, "Failed to compute next actions")
 
 
 # ------------------------------------------------------------------ #

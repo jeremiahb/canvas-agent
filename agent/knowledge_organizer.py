@@ -24,7 +24,7 @@ import hashlib
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -46,12 +46,44 @@ _NOTE_PROMPTS = {
     "assignment_analysis": (
         "You are a diligent student. Analyze this assignment and produce structured study notes.\n\n"
         "Format your response exactly as:\n"
-        "WHAT IS ASKED: (plain-English summary of the task)\n"
-        "KEY REQUIREMENTS:\n- ...\n"
-        "RUBRIC BREAKDOWN:\n- [criterion name]: what excellent work looks like; common mistakes to avoid\n"
-        "STRATEGY: your recommended approach\n"
-        "QUESTIONS TO CLARIFY: any ambiguities before starting\n\n"
+        "WHAT TO SUBMIT: plain-English description of the deliverable\n"
+        "HOW IT WILL BE EVALUATED: rubric criteria or grading approach (if available)\n"
+        "FORMATTING RULES: length, format, citation style, file type requirements\n"
+        "SUBMISSION METHOD: how to submit (file upload, text entry, URL, etc.)\n"
+        "LIKELY SUPPORTING MATERIALS: readings or resources that would help\n"
+        "COMMON PITFALLS: mistakes to avoid based on the requirements\n"
+        "KEY DEADLINES: due date and any intermediate milestones\n"
+        "STUDY QUESTIONS: 3-5 questions a student should answer before starting\n\n"
         "Assignment:\n{content}"
+    ),
+    "announcement_summary": (
+        "You are a student reading a course announcement. Extract what matters.\n\n"
+        "Format your response exactly as:\n"
+        "WHAT CHANGED: what new information or change this announcement communicates\n"
+        "WHAT ACTION IS REQUIRED: specific steps the student must take (if any)\n"
+        "WHAT COURSE ITEM IS AFFECTED: assignment, quiz, schedule item, or general (if applicable)\n"
+        "URGENCY LEVEL: immediate / this week / informational\n\n"
+        "Announcement:\n{content}"
+    ),
+    "quiz_summary": (
+        "You are a student preparing for a quiz. Analyze what you know from the quiz summary.\n\n"
+        "Format your response exactly as:\n"
+        "WHAT IS KNOWN FROM SUMMARY: format, time limit, question count, attempts allowed\n"
+        "SPECIAL REQUIREMENTS: timed, proctored, lockdown browser, or other restrictions\n"
+        "LIKELY FEED-IN CONTENT: module readings or pages that probably feed into this quiz\n"
+        "LIKELY TOPICS TESTED: topics to study based on the quiz title and module context\n"
+        "PREPARATION STRATEGY: recommended approach given the constraints\n\n"
+        "Quiz info:\n{content}"
+    ),
+    "discussion_prompt": (
+        "You are a student preparing to participate in a course discussion. Analyze the prompt.\n\n"
+        "Format your response exactly as:\n"
+        "PROMPT SUMMARY: what the discussion is asking students to address\n"
+        "EXPECTED PARTICIPATION: initial post requirements, reply expectations, point value\n"
+        "LIKELY SUPPORTING READINGS: materials that would inform a strong response\n"
+        "WHETHER REPLIES REQUIRED: yes/no and what good replies look like\n"
+        "KEY ARGUMENT ANGLES: 2-3 perspectives a student could take\n\n"
+        "Discussion:\n{content}"
     ),
     "document_summary": (
         "You are a diligent student. Read this course material and write comprehensive study notes.\n\n"
@@ -144,6 +176,87 @@ def _topic_id(course_id: str, topic_name: str) -> str:
 def _concept_id(topic_id: str, concept_name: str) -> str:
     h = hashlib.sha256(f"{topic_id}:{concept_name}".encode()).hexdigest()[:12]
     return f"concept_{h}"
+
+
+def _parse_date(date_str: str) -> datetime | None:
+    """Parse an ISO date string; return None on failure."""
+    if not date_str:
+        return None
+    try:
+        # Handle both with and without timezone
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _compute_scores(obj, now: datetime | None = None) -> dict:
+    """
+    Compute priority scores for a CanvasObject.
+
+    Returns a dict with urgency_score, importance_score, risk_score,
+    and study_value_score — each in [0.0, 1.0].
+    """
+    try:
+        from agent.canvas_schema import ObjectType, EducationalRole
+    except ImportError:
+        return {}
+
+    if now is None:
+        now = datetime.now(tz=timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    urgency = 0.5
+    importance = getattr(obj, "importance_score", 0.5) or 0.5
+    risk = 0.3
+
+    # Urgency from due date
+    due_dt = _parse_date(getattr(obj, "due_date", None) or "")
+    if due_dt:
+        days_until = (due_dt - now).total_seconds() / 86400
+        if days_until <= 0:
+            urgency = 1.0  # overdue
+        elif days_until <= 1:
+            urgency = 1.0
+        elif days_until <= 3:
+            urgency = 0.9
+        elif days_until <= 7:
+            urgency = 0.7
+        else:
+            urgency = max(0.3, 0.7 - (days_until - 7) * 0.02)
+
+    obj_type = getattr(obj, "object_type", "")
+
+    # Importance by object type
+    if obj_type in (ObjectType.ASSIGNMENT.value, ObjectType.QUIZ_SUMMARY.value):
+        point_value = getattr(obj, "point_value", None)
+        importance = 0.85 if point_value else 0.7
+    elif obj_type == ObjectType.ANNOUNCEMENT.value:
+        posted_dt = _parse_date(getattr(obj, "posted_date", None) or "")
+        if posted_dt:
+            posted_days_ago = (now - posted_dt).total_seconds() / 86400
+            importance = max(0.2, 0.9 - posted_days_ago * 0.05)
+        else:
+            importance = 0.5
+
+    # Risk: no submission yet and due soon
+    submission_state = getattr(obj, "submission_state", None)
+    if not submission_state and urgency >= 0.7:
+        risk = min(1.0, urgency + 0.2)
+
+    # Study value from educational role
+    edu_role = getattr(obj, "educational_role", "")
+    study_value = 0.8 if edu_role == EducationalRole.CORE_INSTRUCTION.value else 0.5
+
+    return {
+        "urgency_score": round(urgency, 3),
+        "importance_score": round(importance, 3),
+        "risk_score": round(risk, 3),
+        "study_value_score": round(study_value, 3),
+    }
 
 
 def _load_processed_ids() -> set:
@@ -256,6 +369,8 @@ class KnowledgeOrganizer:
                 newly_processed.add(doc_id)
                 stats["assignments"] += 1
                 logger.debug(f"Generated assignment note for: {meta.get('title', doc_id)}")
+                if len(newly_processed) % 5 == 0:
+                    _save_processed_ids(processed_ids | newly_processed)
                 await asyncio.sleep(1.0)
             except Exception as e:
                 logger.error(f"Assignment note generation failed [{doc_id}]: {e}")
@@ -287,6 +402,8 @@ class KnowledgeOrganizer:
                 newly_processed.add(doc_id)
                 stats["documents"] += 1
                 logger.debug(f"Generated document note for: {meta.get('title', doc_id)}")
+                if len(newly_processed) % 5 == 0:
+                    _save_processed_ids(processed_ids | newly_processed)
                 await asyncio.sleep(1.0)
             except Exception as e:
                 logger.error(f"Document note generation failed [{doc_id}]: {e}")
@@ -321,12 +438,67 @@ class KnowledgeOrganizer:
                     )
                     newly_processed.add(doc_id)
                     stats["grades"] += 1
+                    if len(newly_processed) % 5 == 0:
+                        _save_processed_ids(processed_ids | newly_processed)
                     await asyncio.sleep(1.0)
                 except Exception as e:
                     logger.error(f"Grade pattern generation failed [{doc_id}]: {e}")
                     stats["errors"] += 1
         except Exception as e:
             logger.error(f"Grade fetch failed: {e}")
+
+        # --- CanvasObjects (typed — assignments, quizzes, discussions, announcements) ---
+        _CANVAS_TYPE_TO_PROMPT = {
+            "assignment":   "assignment_analysis",
+            "quiz_summary": "quiz_summary",
+            "discussion":   "discussion_prompt",
+            "announcement": "announcement_summary",
+        }
+        try:
+            from agent.canvas_schema import ObjectType
+            for obj_type_val, prompt_key in _CANVAS_TYPE_TO_PROMPT.items():
+                try:
+                    objects = self.kb.get_objects_by_course("", object_type=obj_type_val)
+                except Exception as e:
+                    logger.warning(f"canvas_objects fetch failed for {obj_type_val}: {e}")
+                    continue
+                for obj_item in objects:
+                    obj_id = obj_item.get("id", "")
+                    note_key = f"canvas_{obj_id}"
+                    if not obj_id or note_key in processed_ids:
+                        continue
+                    meta = obj_item.get("metadata", {})
+                    content = obj_item.get("document", "") or meta.get("title", "")
+                    if not content:
+                        continue
+                    try:
+                        note_text = await loop.run_in_executor(None, partial(
+                            self._generate_note,
+                            obj_id, content,
+                            prompt_key,
+                            meta.get("title", "Canvas Item"),
+                            meta.get("course_name", ""),
+                        ))
+                        self.kb.save_ai_note(_note_id(obj_id, prompt_key), note_text, {
+                            "note_type": prompt_key,
+                            "source_doc_id": obj_id,
+                            "source_collection": "canvas_objects",
+                            "object_type": obj_type_val,
+                            "course_id": meta.get("course_id", ""),
+                            "course_name": meta.get("course_name", ""),
+                            "title": meta.get("title", ""),
+                            "generated_at": datetime.now().isoformat(),
+                        })
+                        newly_processed.add(note_key)
+                        stats["documents"] += 1
+                        if len(newly_processed) % 5 == 0:
+                            _save_processed_ids(processed_ids | newly_processed)
+                        await asyncio.sleep(1.0)
+                    except Exception as e:
+                        logger.error(f"Canvas object note failed [{obj_id}]: {e}")
+                        stats["errors"] += 1
+        except ImportError:
+            pass
 
         _save_processed_ids(processed_ids | newly_processed)
         logger.info(f"Phase A complete — notes generated: {stats}")
@@ -344,12 +516,14 @@ class KnowledgeOrganizer:
         if loop is None:
             loop = asyncio.get_running_loop()
 
+        logger.info("Phase B starting — fetching notes for topic organization")
         stats = {"courses_processed": 0, "topics_created": 0, "concepts_extracted": 0, "errors": 0}
 
         all_notes = self.kb.get_all_notes()
         if not all_notes:
             logger.info("Phase B skipped — no notes available yet")
             return stats
+        logger.info(f"Phase B — organizing {len(all_notes)} notes across courses")
 
         # Group notes by course
         courses: dict = {}
