@@ -296,7 +296,7 @@ class KnowledgeOrganizer:
         try:
             grade_results = self.kb.course_content.get(
                 where={"type": "grade"},
-                include=["documents", "metadatas", "ids"],
+                include=["documents", "metadatas"],
             )
             for i, doc in enumerate(grade_results.get("documents") or []):
                 meta = grade_results["metadatas"][i]

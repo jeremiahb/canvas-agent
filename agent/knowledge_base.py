@@ -604,7 +604,7 @@ class KnowledgeBase:
         count = self.assignments.count()
         if count == 0:
             return []
-        results = self.assignments.get(include=["documents", "metadatas", "ids"])
+        results = self.assignments.get(include=["documents", "metadatas"])
         return [
             {"id": results["ids"][i], "document": doc, "metadata": results["metadatas"][i]}
             for i, doc in enumerate(results["documents"])
