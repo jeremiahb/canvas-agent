@@ -105,7 +105,7 @@ FREE_MODELS = [
 
 
 # Default free vision model on OpenRouter — swap via VISION_MODEL env var
-_VISION_MODEL_DEFAULT = "meta-llama/llama-3.2-11b-vision-instruct:free"
+_VISION_MODEL_DEFAULT = "meta-llama/llama-3.2-90b-vision-instruct"
 
 
 async def describe_page_visuals(screenshot_bytes: bytes, context: str = "") -> str:
@@ -232,7 +232,15 @@ async def enrich_for_knowledge_base(
     logger.debug(f"[enrich_for_knowledge_base] Sending {len(truncated):,} chars to AI for enrichment")
     try:
         loop = asyncio.get_running_loop()
-        summary = await loop.run_in_executor(None, lambda: _call_api(prompt))
+        response = await loop.run_in_executor(
+            None,
+            lambda: _call_api(
+                system=prompt,
+                messages=[{"role": "user", "content": "Write the notes now."}],
+                max_tokens=2048,
+            ),
+        )
+        summary = _extract_text(response) if response else ""
         if summary:
             logger.info(f"Enriched: {title!r} ({len(summary)} chars summary)")
             logger.debug(f"[enrich_for_knowledge_base] Enrichment complete for {title!r} — total stored: {len(text) + len(summary)} chars")
