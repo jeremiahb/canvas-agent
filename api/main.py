@@ -800,9 +800,9 @@ async def search_notes(body: ChatMessage):
 @app.post("/api/notes/generate")
 async def trigger_note_generation():
     """Manually trigger the full knowledge pipeline for all unprocessed documents."""
+    global _pipeline_task
     if _pipeline_task and not _pipeline_task.done():
         raise HTTPException(409, "Pipeline already running")
-    global _pipeline_task
     _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
     return {"message": "Knowledge pipeline started in background"}
 
