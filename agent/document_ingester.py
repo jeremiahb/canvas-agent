@@ -356,7 +356,14 @@ class DocumentIngester:
             logger.warning(f"Error ingesting pages for {course_name}: {e}")
 
     async def _ingest_module_items(self, course_id: str, course_name: str) -> None:
-        """Walk all module items and process external URLs and file links."""
+        """
+        Walk all module items and process every linked resource.
+
+        Iterates module-by-module so we can attach the module name to each
+        item for context. Processes ALL item types — files, Canvas pages,
+        assignments, discussions, external URLs — letting _process_url()
+        decide the right extraction path.
+        """
         logger.debug(f"[_ingest_module_items] Navigating to modules for {course_name}")
         try:
             await self._goto(f"{self.base_url}/courses/{course_id}/modules")
@@ -369,42 +376,68 @@ class DocumentIngester:
             # Without this, ExternalTool items have {{ id }} Handlebars placeholders.
             await self.page.wait_for_timeout(3000)
 
-            items = await self.page.query_selector_all(".context_module_item")
-            logger.debug(f"[_ingest_module_items] Found {len(items)} .context_module_item elements for {course_name}")
+            # Iterate per module so we capture module names for context
+            modules = await self.page.query_selector_all(".context_module")
+            if not modules:
+                # Fallback: no module wrappers found — process all items flat
+                modules = [None]
 
-            for item in items:
-                link = await item.query_selector("a.external_url_link, a[href*='external']")
-                if not link:
-                    link = await item.query_selector("a.title")
-                if not link:
-                    continue
+            total_items = 0
+            for module_el in modules:
+                # Get module name
+                module_name = ""
+                if module_el:
+                    try:
+                        name_el = await module_el.query_selector(".ig-header-title")
+                        if name_el:
+                            module_name = (await name_el.inner_text()).strip()
+                    except Exception:
+                        pass
 
-                href = await link.get_attribute("href") or ""
-                title = (await link.inner_text()).strip()
+                # Get items within this module (or all items on the page for flat fallback)
+                item_scope = module_el if module_el else self.page
+                items = await item_scope.query_selector_all(".context_module_item")
+                logger.debug(
+                    f"[_ingest_module_items] Module {module_name!r}: {len(items)} items"
+                )
 
-                if not href:
-                    continue
+                for item in items:
+                    link = await item.query_selector("a.external_url_link, a[href*='external']")
+                    if not link:
+                        link = await item.query_selector("a.title")
+                    if not link:
+                        continue
 
-                # Skip unrendered Handlebars template hrefs — React hasn't populated them yet
-                if "{{" in href or "}}" in href:
-                    logger.debug(f"Skipping unrendered module item href: {href!r}")
-                    continue
+                    href = await link.get_attribute("href") or ""
+                    title = (await link.inner_text()).strip()
 
-                full_url = href if href.startswith("http") else f"{self.base_url}{href}"
+                    if not href:
+                        continue
 
-                if self.base_url in full_url and not any(
-                    k in full_url for k in ["/files/", "/download", "/pages/", "/external"]
-                ):
-                    continue
+                    # Skip unrendered Handlebars template hrefs
+                    if "{{" in href or "}}" in href:
+                        logger.debug(f"Skipping unrendered module item href: {href!r}")
+                        continue
 
-                # Skip generic help/support domains — not course-specific content
-                parsed_host = urlparse(full_url).netloc.replace("www.", "")
-                if any(d in parsed_host for d in _SKIP_MODULE_DOMAINS):
-                    logger.debug(f"[_ingest_module_items] Skipping noise domain: {full_url}")
-                    continue
+                    full_url = href if href.startswith("http") else f"{self.base_url}{href}"
 
-                logger.debug(f"[_ingest_module_items] Processing module item: {title!r} -> {full_url}")
-                await self._process_url(full_url, title, course_name, source="module")
+                    # Skip generic help/support domains — no course-specific content
+                    parsed_host = urlparse(full_url).netloc.replace("www.", "")
+                    if any(d in parsed_host for d in _SKIP_MODULE_DOMAINS):
+                        logger.debug(f"[_ingest_module_items] Skipping noise domain: {full_url}")
+                        continue
+
+                    logger.debug(
+                        f"[_ingest_module_items] Processing: {title!r} "
+                        f"(module={module_name!r}) -> {full_url}"
+                    )
+                    await self._process_url(
+                        full_url, title, course_name,
+                        source="module", module_name=module_name
+                    )
+                    total_items += 1
+
+            logger.info(f"[_ingest_module_items] Processed {total_items} module items for {course_name}")
 
         except Exception as e:
             logger.warning(f"Error ingesting module items for {course_name}: {e}")
@@ -413,20 +446,40 @@ class DocumentIngester:
     #  Processing                                                          #
     # ------------------------------------------------------------------ #
 
-    async def _process_url(self, url: str, title: str, course_name: str, source: str) -> None:
+    async def _process_url(
+        self,
+        url: str,
+        title: str,
+        course_name: str,
+        source: str,
+        module_name: str = "",
+    ) -> None:
         """
         Classify a URL and route it to the appropriate handler.
-        RF-Dedup: skip any URL already processed this course to prevent
-        duplicate ingestion and break page-embed cycles.
+
+        Routing priority:
+          1. External gated platforms (VitalSource, Pearson…) → flag for manual upload
+          2. Canvas-hosted files (/files/, /download) → download + extract
+          3. Google Docs / Drive → export-URL fetch
+          4. Microsoft OneDrive / SharePoint → browser fetch
+          5. YouTube → transcript API
+          6. Any other Canvas-internal URL (assignments, discussions, pages,
+             module items, etc.) → browser scrape
+          7. Generic web page → HTTP fetch + HTML extraction
+
+        RF-Dedup + RF-Recursion: global _seen_urls guard prevents re-processing
+        the same URL across multiple discovery passes.
         """
-        # RF-Dedup + RF-Recursion: global guard for this course's crawl
         if url in self._seen_urls:
             logger.debug(f"[_process_url] Skipping duplicate URL: {url}")
             return
         self._seen_urls.add(url)
 
         url_type = classify_url(url)
-        logger.debug(f"[_process_url] {url_type.upper()} | {title!r} | source={source} | {url}")
+        logger.debug(
+            f"[_process_url] {url_type.upper()} | {title!r} | "
+            f"source={source} module={module_name!r} | {url}"
+        )
 
         if url_type == "external_platform":
             platform = detect_external_platform(url)
@@ -437,6 +490,7 @@ class DocumentIngester:
                 "platform": platform,
                 "course_name": course_name,
                 "source": source,
+                "module_name": module_name,
                 "note": f"Manual upload required -- {platform} requires separate login",
             })
 
@@ -449,16 +503,40 @@ class DocumentIngester:
         elif url_type == "youtube":
             await self._fetch_youtube_transcript(url, title, course_name, source)
 
-        elif url_type == "web_page":
+        elif self.base_url and url.startswith(self.base_url):
+            # Any Canvas-internal URL that isn't a file download:
+            # assignments, discussions, module item redirects, wiki pages, etc.
+            # Use the browser (already authenticated) to scrape readable content.
+            await self._scrape_canvas_page(
+                url, course_name, title=title, source=source, module_name=module_name
+            )
+
+        else:
+            # Generic external web page
             await self._fetch_web_page(url, title, course_name, source)
 
-    async def _scrape_canvas_page(self, url: str, course_name: str) -> None:
+    async def _scrape_canvas_page(
+        self,
+        url: str,
+        course_name: str,
+        title: str = "",
+        source: str = "page",
+        module_name: str = "",
+    ) -> None:
         """
-        Scrape a Canvas wiki page: extract text and find embedded links.
-        RF-Recursion: _seen_urls prevents cycles when pages link to each other.
+        Scrape any Canvas-internal page: wiki pages, assignments, discussions,
+        module item redirect URLs, etc.
+
+        Uses a priority list of content selectors so the right body is captured
+        regardless of the page type. After extracting text it also follows any
+        embedded external links so resources linked from within a page are also
+        ingested.
+
+        RF-Recursion: _seen_urls prevents cycles when pages link each other.
         """
-        # RF-Dedup: guard at entry so repeated calls from different discovery
-        # passes are all caught in one place
+        # _seen_urls guard is in _process_url — but guard again here for calls
+        # that come directly from _ingest_pages (which uses _scrape_canvas_page
+        # directly without going through _process_url).
         if url in self._seen_urls:
             logger.debug(f"[_scrape_canvas_page] Skipping duplicate: {url}")
             return
@@ -469,52 +547,112 @@ class DocumentIngester:
             await self._goto(url)
             await asyncio.sleep(0.5)
 
-            title_el = await self.page.query_selector("h1.page-title, h1")
-            title = (await title_el.inner_text()).strip() if title_el else "Canvas Page"
+            # Resolve title from page if not provided
+            if not title:
+                for sel in ["h1.page-title", "h1.title", ".discussion-title h1", "h1"]:
+                    title_el = await self.page.query_selector(sel)
+                    if title_el:
+                        title = (await title_el.inner_text()).strip()
+                        break
+                if not title:
+                    title = "Canvas Page"
             logger.debug(f"[_scrape_canvas_page] Page title: {title!r}")
 
-            body_el = await self.page.query_selector(".show-content, #wiki_page_show")
-            if body_el:
-                text = await body_el.inner_text()
-                logger.debug(f"[_scrape_canvas_page] Body text: {len(text)} chars")
-                if text.strip():
-                    # Vision: supplement text with visual extraction when the page
-                    # contains images or tables that plain scraping would miss
-                    imgs = await body_el.query_selector_all("img")
-                    tables = await body_el.query_selector_all("table")
-                    logger.debug(f"[_scrape_canvas_page] {len(imgs)} images, {len(tables)} tables found on page")
-                    if imgs or tables:
-                        logger.debug(f"[_scrape_canvas_page] Vision enabled check — taking screenshot for {url}")
-                        from agent.brain import describe_page_visuals
-                        try:
-                            screenshot = await self.page.screenshot(full_page=True)
-                            logger.debug(f"[_scrape_canvas_page] Screenshot taken: {len(screenshot):,} bytes — sending to vision model")
-                            vision_text = await describe_page_visuals(screenshot, url)
-                            if vision_text:
-                                logger.debug(f"[_scrape_canvas_page] Vision extracted {len(vision_text)} chars")
-                                text = text.strip() + f"\n\n[VISUAL CONTENT]\n{vision_text}"
-                        except Exception as e:
-                            logger.warning(f"Vision screenshot failed for {url}: {e}")
-                    logger.debug(f"[_scrape_canvas_page] Enriching {title!r} with AI")
-                    from agent.brain import enrich_for_knowledge_base
-                    enriched = await enrich_for_knowledge_base(
-                        text.strip(), title, course_name, "canvas_page", url
-                    )
-                    logger.debug(f"[_scrape_canvas_page] Enriched text: {len(enriched)} chars — storing result")
-                    self._store_result(title, enriched, url, course_name, "page", "html_page")
+            # Content selectors in priority order — covers wiki pages, assignments,
+            # discussions, announcements, and generic content areas
+            content_selectors = [
+                ".show-content",                  # wiki/pages
+                "#wiki_page_show",                # wiki (older Canvas)
+                ".assignment-description",        # assignment body
+                ".description.user_content",      # assignment alt
+                "#assignment_description",        # assignment alt 2
+                ".discussion-entries",            # discussion replies
+                ".discussion-section .entry-content",
+                ".announcement-content",          # announcements
+                "#announcement_message_holder",
+                "#content",                       # generic content
+                "main",                           # HTML5 main
+            ]
 
-            links = await self.page.query_selector_all(
-                ".show-content a[href], #wiki_page_show a[href]"
+            body_el = None
+            for sel in content_selectors:
+                body_el = await self.page.query_selector(sel)
+                if body_el:
+                    logger.debug(f"[_scrape_canvas_page] Content selector matched: {sel}")
+                    break
+
+            if not body_el:
+                logger.debug(f"[_scrape_canvas_page] No specific content selector matched — using body")
+                body_el = await self.page.query_selector("body")
+
+            text = ""
+            if body_el:
+                text = (await body_el.inner_text()).strip()
+                logger.debug(f"[_scrape_canvas_page] Body text: {len(text)} chars")
+
+            if text and len(text) > 50:
+                # Vision: supplement with screenshot if rich media is present
+                imgs = await (body_el or self.page).query_selector_all("img")
+                tables = await (body_el or self.page).query_selector_all("table")
+                logger.debug(f"[_scrape_canvas_page] {len(imgs)} images, {len(tables)} tables")
+                if imgs or tables:
+                    try:
+                        from agent.brain import describe_page_visuals
+                        screenshot = await self.page.screenshot(full_page=True)
+                        logger.debug(f"[_scrape_canvas_page] Screenshot {len(screenshot):,} bytes")
+                        vision_text = await describe_page_visuals(screenshot, url)
+                        if vision_text:
+                            logger.debug(f"[_scrape_canvas_page] Vision: {len(vision_text)} chars")
+                            text = text + f"\n\n[VISUAL CONTENT]\n{vision_text}"
+                    except Exception as e:
+                        logger.debug(f"Vision screenshot skipped: {e}")
+
+                # Determine doc_type from URL path
+                url_path = urlparse(url).path.lower()
+                if "/assignments/" in url_path:
+                    doc_type = "canvas_assignment"
+                elif "/discussion_topics/" in url_path:
+                    doc_type = "canvas_discussion"
+                elif "/announcements/" in url_path:
+                    doc_type = "canvas_announcement"
+                elif "/pages/" in url_path:
+                    doc_type = "canvas_page"
+                else:
+                    doc_type = "canvas_content"
+
+                from agent.brain import enrich_for_knowledge_base
+                enriched = await enrich_for_knowledge_base(
+                    text, title, course_name, doc_type, url
+                )
+                self._store_result(
+                    title, enriched, url, course_name,
+                    source=source, doc_type=doc_type,
+                    module_name=module_name,
+                )
+                logger.info(
+                    f"[_scrape_canvas_page] Stored {len(enriched):,} chars: "
+                    f"{title!r} ({doc_type}) module={module_name!r}"
+                )
+            else:
+                logger.debug(f"[_scrape_canvas_page] Insufficient text ({len(text)} chars) — skipping storage")
+
+            # Follow embedded external links
+            link_els = await self.page.query_selector_all(
+                ".show-content a[href], #wiki_page_show a[href], "
+                ".assignment-description a[href], .discussion-entries a[href], "
+                ".announcement-content a[href], #content a[href]"
             )
-            logger.debug(f"[_scrape_canvas_page] Found {len(links)} embedded links on page {title!r}")
-            for link in links:
-                href = await link.get_attribute("href") or ""
-                link_title = (await link.inner_text()).strip() or title
+            logger.debug(f"[_scrape_canvas_page] {len(link_els)} embedded links on {title!r}")
+            for link_el in link_els:
+                href = await link_el.get_attribute("href") or ""
+                link_title = (await link_el.inner_text()).strip() or title
                 if not href or href.startswith("#"):
                     continue
                 full_url = href if href.startswith("http") else f"{self.base_url}{href}"
-                logger.debug(f"[_scrape_canvas_page] Embedded link: {link_title!r} -> {full_url}")
-                await self._process_url(full_url, link_title, course_name, source="page_embed")
+                await self._process_url(
+                    full_url, link_title, course_name,
+                    source="page_embed", module_name=module_name
+                )
 
         except Exception as e:
             logger.warning(f"Error scraping Canvas page {url}: {e}")
@@ -768,8 +906,37 @@ class DocumentIngester:
         course_name: str,
         source: str,
         doc_type: str,
+        module_name: str = "",
     ) -> None:
-        """Append an extracted document to the results list."""
+        """
+        Append an extracted document to the results list.
+        Attaches intake pipeline classification metadata to each result so
+        knowledge_base.ingest_knowledge() can store richer ChromaDB metadata.
+        """
+        # Run synchronous pipeline classification for metadata enrichment
+        intake_meta: dict = {}
+        try:
+            from agent.intake_pipeline import ItemClassifier, ItemContext
+            classifier = ItemClassifier()
+            ctx = ItemContext(
+                source_url=url,
+                course_name=course_name,
+                module_name=module_name,
+                source_label=source,
+                anchor_text=title,
+            )
+            # Classify from URL + first 512 chars of text
+            classification = classifier.classify(url, content_snippet=text[:512], context=ctx)
+            intake_meta = {
+                "content_type": classification.content_type.value,
+                "input_type": classification.source_type.value,
+                "intent": classification.intent.value,
+                "classifier_reasons": " | ".join(classification.reasons),
+                "classifier_confidence": classification.confidence,
+            }
+        except Exception as e:
+            logger.debug(f"[_store_result] Classification metadata skipped: {e}")
+
         self.results.append({
             "title": title,
             "text": text,
@@ -777,5 +944,7 @@ class DocumentIngester:
             "course_name": course_name,
             "source": source,
             "doc_type": doc_type,
+            "module_name": module_name,
             "char_count": len(text),
+            **intake_meta,
         })

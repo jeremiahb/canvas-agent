@@ -94,14 +94,13 @@ _AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-4-20250514")
 # Add $5 at openrouter.ai/settings/credits — free models cost $0 but credits
 # must be present for the account to be activated.
 FREE_MODELS = [
-    {"id": "openrouter/auto", "label": "OpenRouter Auto · picks best available free model"},
-    {"id": "google/gemini-2.5-pro-exp-03-25:free", "label": "Gemini 2.5 Pro (free) · 1M ctx · best quality"},
-    {"id": "meta-llama/llama-4-maverick:free", "label": "Llama 4 Maverick (free) · 1M ctx · strong all-rounder"},
-    {"id": "meta-llama/llama-4-scout:free", "label": "Llama 4 Scout (free) · 10M ctx · massive context"},
-    {"id": "deepseek/deepseek-r1:free", "label": "DeepSeek R1 (free) · 164K ctx · strong reasoning"},
+    {"id": "openrouter/auto",                               "label": "OpenRouter Auto · best available free model (recommended)"},
+    {"id": "google/gemini-2.0-flash-exp:free",              "label": "Gemini 2.0 Flash (free) · fast, 1M ctx"},
+    {"id": "deepseek/deepseek-chat-v3-0324:free",           "label": "DeepSeek Chat V3 (free) · strong reasoning"},
+    {"id": "meta-llama/llama-3.3-70b-instruct:free",        "label": "Llama 3.3 70B (free) · 131K ctx · reliable"},
     {"id": "mistralai/mistral-small-3.1-24b-instruct:free", "label": "Mistral Small 3.1 (free) · 128K ctx"},
-    {"id": "meta-llama/llama-3.3-70b-instruct:free", "label": "Llama 3.3 70B (free) · 131K ctx · reliable"},
-    {"id": "anthropic/claude-sonnet-4-5", "label": "Claude Sonnet 4.5 (paid) · best quality"},
+    {"id": "qwen/qwen2.5-72b-instruct:free",                "label": "Qwen 2.5 72B (free) · strong multilingual"},
+    {"id": "anthropic/claude-sonnet-4-5",                   "label": "Claude Sonnet 4.5 (paid) · best quality"},
 ]
 
 
@@ -321,34 +320,70 @@ def _call_api(system: str, messages: list, max_tokens: int = 2048):
     Make a completion call to whichever provider is configured.
     Anthropic and OpenRouter have different call signatures — this
     normalises them so callers don't need to care.
+
+    If the selected model returns HTTP 404 (endpoint not found) or 429
+    (rate-limited) and is not already openrouter/auto, we automatically
+    retry once with openrouter/auto so the caller never sees a failure
+    just because a specific free model is temporarily unavailable.
     """
     client = _get_client()
-    provider = "OpenRouter" if hasattr(client, "chat") else "Anthropic"
+    is_openrouter = hasattr(client, "chat")
+    provider = "OpenRouter" if is_openrouter else "Anthropic"
     msg_count = len(messages)
     last_msg_preview = (messages[-1].get("content", "") if messages else "")[:80] if messages else ""
-    logger.debug(f"[_call_api] {provider} | model={_AI_MODEL} | max_tokens={max_tokens} | messages={msg_count} | last_msg={last_msg_preview!r}")
 
-    # OpenRouter / OpenAI format
-    if hasattr(client, "chat"):
-        response = client.chat.completions.create(
-            model=_AI_MODEL,
-            max_tokens=max_tokens,
-            messages=[{"role": "system", "content": system}] + messages,
+    # Build the list of models to try; fall back to openrouter/auto on 404/429
+    models_to_try = [_AI_MODEL]
+    if is_openrouter and _AI_MODEL != "openrouter/auto":
+        models_to_try.append("openrouter/auto")
+
+    last_exc: Exception | None = None
+    for model in models_to_try:
+        logger.debug(
+            f"[_call_api] {provider} | model={model} | max_tokens={max_tokens} "
+            f"| messages={msg_count} | last_msg={last_msg_preview!r}"
         )
-        usage = getattr(response, "usage", None)
-        if usage:
-            logger.debug(f"[_call_api] Response tokens — prompt={getattr(usage, 'prompt_tokens', '?')} completion={getattr(usage, 'completion_tokens', '?')}")
-        return response
+        try:
+            if is_openrouter:
+                response = client.chat.completions.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "system", "content": system}] + messages,
+                )
+                usage = getattr(response, "usage", None)
+                if usage:
+                    logger.debug(
+                        f"[_call_api] tokens — prompt={getattr(usage, 'prompt_tokens', '?')} "
+                        f"completion={getattr(usage, 'completion_tokens', '?')}"
+                    )
+                return response
 
-    # Anthropic format
-    response = client.messages.create(
-        model=_AI_MODEL,
-        max_tokens=max_tokens,
-        system=system,
-        messages=messages,
-    )
-    logger.debug(f"[_call_api] Anthropic response — stop_reason={response.stop_reason} input={response.usage.input_tokens} output={response.usage.output_tokens}")
-    return response
+            # Anthropic format
+            response = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+            )
+            logger.debug(
+                f"[_call_api] Anthropic — stop_reason={response.stop_reason} "
+                f"input={response.usage.input_tokens} output={response.usage.output_tokens}"
+            )
+            return response
+
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if is_openrouter and status in (404, 429) and model != "openrouter/auto":
+                logger.warning(
+                    f"[_call_api] Model {model!r} failed with HTTP {status} — "
+                    "falling back to openrouter/auto"
+                )
+                last_exc = e
+                continue
+            raise  # re-raise immediately for non-retriable errors
+
+    # All models exhausted (should only happen after a single 404/429 retry)
+    raise last_exc  # type: ignore[misc]
 
 
 class AgentBrain:
