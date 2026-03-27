@@ -268,11 +268,15 @@ class DocumentIngester:
         self.flagged = []
         self._seen_urls = set()  # reset per course
 
-        logger.debug(f"[ingest_course_documents] Phase 1/3 — ingesting Files page")
-        await self._ingest_files_page(course_id, course_name)
-        logger.debug(f"[ingest_course_documents] Phase 2/3 — ingesting Canvas Pages")
+        # Phase 1: Canvas Pages index — picks up any instructor-created pages
+        # (some may not be linked from modules)
+        logger.debug(f"[ingest_course_documents] Phase 1/2 — ingesting Canvas Pages")
         await self._ingest_pages(course_id, course_name)
-        logger.debug(f"[ingest_course_documents] Phase 3/3 — ingesting Module items")
+
+        # Phase 2: Module items — files, assignments, discussions, external links
+        # are all discovered here as the crawler walks each module naturally.
+        # There is no separate /files page pass; files are picked up inline.
+        logger.debug(f"[ingest_course_documents] Phase 2/2 — ingesting Module items")
         await self._ingest_module_items(course_id, course_name)
 
         logger.info(
