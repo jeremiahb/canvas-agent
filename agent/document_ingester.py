@@ -268,16 +268,18 @@ class DocumentIngester:
         self.flagged = []
         self._seen_urls = set()  # reset per course
 
-        # Phase 1: Canvas Pages index — picks up any instructor-created pages
-        # (some may not be linked from modules)
-        logger.debug(f"[ingest_course_documents] Phase 1/2 — ingesting Canvas Pages")
-        await self._ingest_pages(course_id, course_name)
-
-        # Phase 2: Module items — files, assignments, discussions, external links
-        # are all discovered here as the crawler walks each module naturally.
-        # There is no separate /files page pass; files are picked up inline.
-        logger.debug(f"[ingest_course_documents] Phase 2/2 — ingesting Module items")
+        # Phase 1: Module items — primary source of truth.
+        # Files, assignments, discussions, pages, and external links are all
+        # discovered here with full module context (module name, anchor text).
+        # Running this first ensures every item gets its richest possible metadata.
+        logger.debug(f"[ingest_course_documents] Phase 1/2 — ingesting Module items")
         await self._ingest_module_items(course_id, course_name)
+
+        # Phase 2: Canvas Pages index — catch-all for instructor-created pages
+        # that are not linked from any module. Pages already visited during
+        # Phase 1 are in _seen_urls and will be skipped automatically.
+        logger.debug(f"[ingest_course_documents] Phase 2/2 — ingesting Canvas Pages (catch-all)")
+        await self._ingest_pages(course_id, course_name)
 
         logger.info(
             f"Course {course_name}: ingested {len(self.results)} documents, "
