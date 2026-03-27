@@ -148,7 +148,7 @@ class GraphBuilder:
                 if resolved and resolved.id != o.id:
                     edges.append(_make_edge(
                         o.id, resolved.id,
-                        RelationType.MODULE_ITEM_RESOLVES_TO_OBJECT.value,
+                        RelationType.MODULE_ITEM_RESOLVES_TO.value,
                         confidence=0.95,
                         evidence=[f"canonical_url match: {o.canonical_url}"],
                     ))
@@ -234,7 +234,7 @@ class GraphBuilder:
                     if atitle_l and title_l and (atitle_l in title_l or title_l in atitle_l):
                         edges.append(_make_edge(
                             o.id, assign_obj.id,
-                            RelationType.CALENDAR_ITEM_REFERS_TO_OBJECT.value,
+                            RelationType.CALENDAR_REFERS_TO.value,
                             confidence=0.8,
                             evidence=[f"title match: '{o.title}' ~ '{assign_obj.title}'"],
                         ))
@@ -249,7 +249,7 @@ class GraphBuilder:
                     if len(atitle_l) >= 6 and atitle_l in body_l:
                         edges.append(_make_edge(
                             o.id, assign_obj.id,
-                            RelationType.GRADE_SIGNAL_REFERS_TO_ASSIGNMENT.value,
+                            RelationType.GRADE_SIGNAL_REFERS_TO.value,
                             confidence=0.7,
                             evidence=[f"assignment '{assign_obj.title}' referenced in grade signal"],
                         ))

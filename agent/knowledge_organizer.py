@@ -342,72 +342,77 @@ class KnowledgeOrganizer:
         processed_ids = _load_processed_ids()
         newly_processed: set = set()
         stats = {"assignments": 0, "documents": 0, "grades": 0, "errors": 0}
+        sem = asyncio.Semaphore(5)
 
         # --- Assignments ---
-        for item in self.kb.get_all_assignments():
+        async def _process_assignment(item: dict) -> None:
             doc_id = item.get("id", "")
             if not doc_id or doc_id in processed_ids:
-                continue
+                return
             meta = item.get("metadata", {})
-            try:
-                note_text = await loop.run_in_executor(None, partial(
-                    self._generate_note,
-                    doc_id, item.get("document", ""),
-                    "assignment_analysis",
-                    meta.get("title", "Unknown Assignment"),
-                    meta.get("course_name", ""),
-                ))
-                self.kb.save_ai_note(_note_id(doc_id, "assignment_analysis"), note_text, {
-                    "note_type": "assignment_analysis",
-                    "source_doc_id": doc_id,
-                    "source_collection": "assignments",
-                    "course_id": meta.get("course_id", ""),
-                    "course_name": meta.get("course_name", ""),
-                    "title": meta.get("title", ""),
-                    "generated_at": datetime.now().isoformat(),
-                })
-                newly_processed.add(doc_id)
-                stats["assignments"] += 1
-                logger.debug(f"Generated assignment note for: {meta.get('title', doc_id)}")
-                if len(newly_processed) % 5 == 0:
-                    _save_processed_ids(processed_ids | newly_processed)
-                await asyncio.sleep(1.0)
-            except Exception as e:
-                logger.error(f"Assignment note generation failed [{doc_id}]: {e}")
-                stats["errors"] += 1
+            async with sem:
+                try:
+                    note_text = await loop.run_in_executor(None, partial(
+                        self._generate_note,
+                        doc_id, item.get("document", ""),
+                        "assignment_analysis",
+                        meta.get("title", "Unknown Assignment"),
+                        meta.get("course_name", ""),
+                    ))
+                    self.kb.save_ai_note(_note_id(doc_id, "assignment_analysis"), note_text, {
+                        "note_type": "assignment_analysis",
+                        "source_doc_id": doc_id,
+                        "source_collection": "assignments",
+                        "course_id": meta.get("course_id", ""),
+                        "course_name": meta.get("course_name", ""),
+                        "title": meta.get("title", ""),
+                        "generated_at": datetime.now().isoformat(),
+                    })
+                    newly_processed.add(doc_id)
+                    stats["assignments"] += 1
+                    logger.info(f"Generated assignment note for: {meta.get('title', doc_id)}")
+                    if len(newly_processed) % 5 == 0:
+                        _save_processed_ids(processed_ids | newly_processed)
+                except Exception as e:
+                    logger.error(f"Assignment note generation failed [{doc_id}]: {e}")
+                    stats["errors"] += 1
+
+        await asyncio.gather(*[_process_assignment(item) for item in self.kb.get_all_assignments()])
 
         # --- Documents (first chunk per document only) ---
-        for item in self.kb.get_documents_first_chunks():
+        async def _process_document(item: dict) -> None:
             doc_id = item.get("id", "")
             if not doc_id or doc_id in processed_ids:
-                continue
+                return
             meta = item.get("metadata", {})
-            try:
-                note_text = await loop.run_in_executor(None, partial(
-                    self._generate_note,
-                    doc_id, item.get("document", ""),
-                    "document_summary",
-                    meta.get("title", "Unknown Document"),
-                    meta.get("course_name", ""),
-                ))
-                self.kb.save_ai_note(_note_id(doc_id, "document_summary"), note_text, {
-                    "note_type": "document_summary",
-                    "source_doc_id": doc_id,
-                    "source_collection": "documents",
-                    "course_id": meta.get("course_id", ""),
-                    "course_name": meta.get("course_name", ""),
-                    "title": meta.get("title", ""),
-                    "generated_at": datetime.now().isoformat(),
-                })
-                newly_processed.add(doc_id)
-                stats["documents"] += 1
-                logger.debug(f"Generated document note for: {meta.get('title', doc_id)}")
-                if len(newly_processed) % 5 == 0:
-                    _save_processed_ids(processed_ids | newly_processed)
-                await asyncio.sleep(1.0)
-            except Exception as e:
-                logger.error(f"Document note generation failed [{doc_id}]: {e}")
-                stats["errors"] += 1
+            async with sem:
+                try:
+                    note_text = await loop.run_in_executor(None, partial(
+                        self._generate_note,
+                        doc_id, item.get("document", ""),
+                        "document_summary",
+                        meta.get("title", "Unknown Document"),
+                        meta.get("course_name", ""),
+                    ))
+                    self.kb.save_ai_note(_note_id(doc_id, "document_summary"), note_text, {
+                        "note_type": "document_summary",
+                        "source_doc_id": doc_id,
+                        "source_collection": "documents",
+                        "course_id": meta.get("course_id", ""),
+                        "course_name": meta.get("course_name", ""),
+                        "title": meta.get("title", ""),
+                        "generated_at": datetime.now().isoformat(),
+                    })
+                    newly_processed.add(doc_id)
+                    stats["documents"] += 1
+                    logger.info(f"Generated document note for: {meta.get('title', doc_id)}")
+                    if len(newly_processed) % 5 == 0:
+                        _save_processed_ids(processed_ids | newly_processed)
+                except Exception as e:
+                    logger.error(f"Document note generation failed [{doc_id}]: {e}")
+                    stats["errors"] += 1
+
+        await asyncio.gather(*[_process_document(item) for item in self.kb.get_documents_first_chunks()])
 
         # --- Grade entries → instructor_patterns ---
         try:
@@ -415,35 +420,39 @@ class KnowledgeOrganizer:
                 where={"type": "grade"},
                 include=["documents", "metadatas"],
             )
-            for i, doc in enumerate(grade_results.get("documents") or []):
+
+            async def _process_grade(i: int, doc: str) -> None:
                 meta = grade_results["metadatas"][i]
                 doc_id = grade_results["ids"][i]
                 if doc_id in processed_ids:
-                    continue
+                    return
                 if str(meta.get("score", "-")).strip() == "-":
-                    continue  # skip ungraded
-                try:
-                    note_text = await loop.run_in_executor(None, partial(
-                        self._generate_note,
-                        doc_id, doc,
-                        "grade_pattern",
-                        meta.get("assignment", "Grade Entry"),
-                        meta.get("course_name", ""),
-                    ))
-                    self.kb.instructor_patterns.upsert(
-                        ids=[f"pattern_{doc_id}"],
-                        documents=[note_text],
-                        metadatas=[{**meta, "pattern_type": "grade_based",
-                                    "generated_at": datetime.now().isoformat()}],
-                    )
-                    newly_processed.add(doc_id)
-                    stats["grades"] += 1
-                    if len(newly_processed) % 5 == 0:
-                        _save_processed_ids(processed_ids | newly_processed)
-                    await asyncio.sleep(1.0)
-                except Exception as e:
-                    logger.error(f"Grade pattern generation failed [{doc_id}]: {e}")
-                    stats["errors"] += 1
+                    return  # skip ungraded
+                async with sem:
+                    try:
+                        note_text = await loop.run_in_executor(None, partial(
+                            self._generate_note,
+                            doc_id, doc,
+                            "grade_pattern",
+                            meta.get("assignment", "Grade Entry"),
+                            meta.get("course_name", ""),
+                        ))
+                        self.kb.instructor_patterns.upsert(
+                            ids=[f"pattern_{doc_id}"],
+                            documents=[note_text],
+                            metadatas=[{**meta, "pattern_type": "grade_based",
+                                        "generated_at": datetime.now().isoformat()}],
+                        )
+                        newly_processed.add(doc_id)
+                        stats["grades"] += 1
+                        if len(newly_processed) % 5 == 0:
+                            _save_processed_ids(processed_ids | newly_processed)
+                    except Exception as e:
+                        logger.error(f"Grade pattern generation failed [{doc_id}]: {e}")
+                        stats["errors"] += 1
+
+            docs_list = grade_results.get("documents") or []
+            await asyncio.gather(*[_process_grade(i, doc) for i, doc in enumerate(docs_list)])
         except Exception as e:
             logger.error(f"Grade fetch failed: {e}")
 
@@ -455,22 +464,18 @@ class KnowledgeOrganizer:
             "announcement": "announcement_summary",
         }
         try:
-            from agent.canvas_schema import ObjectType
-            for obj_type_val, prompt_key in _CANVAS_TYPE_TO_PROMPT.items():
-                try:
-                    objects = self.kb.get_objects_by_course("", object_type=obj_type_val)
-                except Exception as e:
-                    logger.warning(f"canvas_objects fetch failed for {obj_type_val}: {e}")
-                    continue
-                for obj_item in objects:
-                    obj_id = obj_item.get("id", "")
-                    note_key = f"canvas_{obj_id}"
-                    if not obj_id or note_key in processed_ids:
-                        continue
-                    meta = obj_item.get("metadata", {})
-                    content = obj_item.get("document", "") or meta.get("title", "")
-                    if not content:
-                        continue
+            from agent.canvas_schema import ObjectType  # noqa: F401
+
+            async def _process_canvas_object(obj_item: dict, obj_type_val: str, prompt_key: str) -> None:
+                obj_id = obj_item.get("id", "")
+                note_key = f"canvas_{obj_id}"
+                if not obj_id or note_key in processed_ids:
+                    return
+                meta = obj_item.get("metadata", {})
+                content = obj_item.get("document", "") or meta.get("title", "")
+                if not content:
+                    return
+                async with sem:
                     try:
                         note_text = await loop.run_in_executor(None, partial(
                             self._generate_note,
@@ -493,10 +498,20 @@ class KnowledgeOrganizer:
                         stats["documents"] += 1
                         if len(newly_processed) % 5 == 0:
                             _save_processed_ids(processed_ids | newly_processed)
-                        await asyncio.sleep(1.0)
                     except Exception as e:
                         logger.error(f"Canvas object note failed [{obj_id}]: {e}")
                         stats["errors"] += 1
+
+            canvas_tasks = []
+            for obj_type_val, prompt_key in _CANVAS_TYPE_TO_PROMPT.items():
+                try:
+                    objects = self.kb.get_objects_by_course("", object_type=obj_type_val)
+                except Exception as e:
+                    logger.warning(f"canvas_objects fetch failed for {obj_type_val}: {e}")
+                    continue
+                for obj_item in objects:
+                    canvas_tasks.append(_process_canvas_object(obj_item, obj_type_val, prompt_key))
+            await asyncio.gather(*canvas_tasks)
         except ImportError:
             pass
 

@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 CANVAS_URL = os.environ.get("CANVAS_URL", "https://wilmu.instructure.com").rstrip("/")
 
-_MIN_DELAY = 0.8
-_MAX_DELAY = 1.8
+_MIN_DELAY = 0.4
+_MAX_DELAY = 0.9
 
 # Course name fragments to skip — admin/orientation courses with no real assignments
 _SKIP_COURSE_FRAGMENTS = ["BrushUp", "Student Assistance", "Orientation", "Tutorial"]
@@ -451,15 +451,20 @@ class CanvasCrawler:
         logger.debug(f"[get_assignments] course_id={course_id} — returning {len(assignments)} assignments")
         return assignments
 
-    async def get_assignment_details(self, assignment_url: str) -> dict:
-        """Return description, submission types, points, and rubric for one assignment."""
+    async def get_assignment_details(self, assignment_url: str, page=None) -> dict:
+        """Return description, submission types, points, and rubric for one assignment.
+
+        Pass an explicit ``page`` to run concurrently on a separate Playwright page;
+        omit to use ``self.page`` (the default, single-page behaviour).
+        """
+        _page = page or self.page
         logger.debug(f"[get_assignment_details] Navigating to {assignment_url}")
-        await self._goto(assignment_url)
+        await _polite_goto(_page, assignment_url)
         try:
-            await self.page.wait_for_selector("#assignment_description, .assignment-description", timeout=8000)
+            await _page.wait_for_selector("#assignment_description, .assignment-description", timeout=8000)
         except Exception:
             logger.debug(f"[get_assignment_details] Selector timeout — falling back to 2s wait for {assignment_url}")
-            await self.page.wait_for_timeout(2000)
+            await _page.wait_for_timeout(2000)
 
         details: dict = {
             "description": "",
@@ -469,23 +474,23 @@ class CanvasCrawler:
         }
 
         try:
-            desc_el = await self.page.query_selector("#assignment_description")
+            desc_el = await _page.query_selector("#assignment_description")
             if desc_el:
                 details["description"] = await desc_el.inner_text()
                 logger.debug(f"[get_assignment_details] Description: {len(details['description'])} chars")
             else:
                 logger.debug(f"[get_assignment_details] No #assignment_description found at {assignment_url}")
 
-            sub_els = await self.page.query_selector_all(".submission_type")
+            sub_els = await _page.query_selector_all(".submission_type")
             details["submission_types"] = [await el.inner_text() for el in sub_els]
             logger.debug(f"[get_assignment_details] submission_types={details['submission_types']}")
 
-            pts_el = await self.page.query_selector(".points_possible")
+            pts_el = await _page.query_selector(".points_possible")
             if pts_el:
                 details["points_possible"] = await pts_el.inner_text()
                 logger.debug(f"[get_assignment_details] points_possible={details['points_possible']!r}")
 
-            rubric_rows = await self.page.query_selector_all(".rubric_criterion")
+            rubric_rows = await _page.query_selector_all(".rubric_criterion")
             logger.debug(f"[get_assignment_details] Found {len(rubric_rows)} rubric criteria rows")
             for row in rubric_rows:
                 desc = await row.query_selector(".description")
@@ -505,7 +510,7 @@ class CanvasCrawler:
         # Vision: capture rubric tables, diagrams, and other visual content
         from agent.brain import describe_page_visuals
         try:
-            screenshot = await self.page.screenshot(full_page=True)
+            screenshot = await _page.screenshot(full_page=True)
             vision_text = await describe_page_visuals(screenshot, assignment_url)
             if vision_text:
                 details["description"] = (
@@ -1456,13 +1461,44 @@ class CanvasCrawler:
             await self._save_page_snapshot(f"{slug}_{cid}_assignments")
             logger.info(f"  Found {len(assignments)} assignments")
 
-            # Skip per-assignment detail pages during bulk crawl — they each cost
-            # a full page navigation + delay. Details are fetched on-demand when
-            # the user generates a specific assignment.
             for a in assignments:
                 logger.info(f"  -> {a['title']}")
-                logger.debug(f"[crawl_all]    id={a['id']} due={a.get('due')!r} points={a.get('points')!r}")
-                a["details"] = {}  # populated on-demand via get_assignment_details()
+
+            # Fetch assignment details concurrently — up to 5 Playwright pages in parallel
+            _DETAIL_CONCURRENCY = 5
+            detail_pages = []
+            try:
+                detail_pages = [await self.context.new_page() for _ in range(min(_DETAIL_CONCURRENCY, len(assignments)))]
+            except Exception as _dp_err:
+                logger.warning(f"[crawl_all] Could not create detail pages: {_dp_err}")
+
+            detail_sem = asyncio.Semaphore(_DETAIL_CONCURRENCY)
+            page_pool = list(detail_pages)
+            page_idx = 0
+            page_pool_lock = asyncio.Lock()
+
+            async def _fetch_details(a: dict) -> None:
+                nonlocal page_idx
+                async with detail_sem:
+                    async with page_pool_lock:
+                        _pg = page_pool[page_idx % len(page_pool)] if page_pool else None
+                        page_idx += 1
+                    try:
+                        a["details"] = await self.get_assignment_details(a["url"], page=_pg)
+                        desc_len = len(a["details"].get("description", "") or "")
+                        logger.debug(f"[crawl_all] details for {a['title']!r}: {desc_len} chars")
+                    except Exception as _det_err:
+                        logger.warning(f"[crawl_all] Failed to get details for {a['title']!r}: {_det_err}")
+                        a["details"] = {}
+
+            try:
+                await asyncio.gather(*[_fetch_details(a) for a in assignments])
+            finally:
+                for _dp in detail_pages:
+                    try:
+                        await _dp.close()
+                    except Exception:
+                        pass
 
             course["assignments"] = assignments
 

@@ -479,7 +479,6 @@ class DocumentIngester:
         if url in self._seen_urls:
             logger.debug(f"[_process_url] Skipping duplicate URL: {url}")
             return
-        self._seen_urls.add(url)
 
         url_type = classify_url(url)
         logger.debug(
@@ -520,6 +519,12 @@ class DocumentIngester:
         else:
             # Generic external web page
             await self._fetch_web_page(url, title, course_name, source)
+
+        # Mark URL as seen for all non-canvas-page paths.
+        # Canvas-internal pages are marked inside _scrape_canvas_page itself
+        # (so that the guard there works for direct calls from _ingest_pages).
+        if url not in self._seen_urls:
+            self._seen_urls.add(url)
 
     async def _scrape_canvas_page(
         self,
