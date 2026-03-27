@@ -268,12 +268,18 @@ class DocumentIngester:
         self.flagged = []
         self._seen_urls = set()  # reset per course
 
-        logger.debug(f"[ingest_course_documents] Phase 1/3 — ingesting Files page")
-        await self._ingest_files_page(course_id, course_name)
-        logger.debug(f"[ingest_course_documents] Phase 2/3 — ingesting Canvas Pages")
-        await self._ingest_pages(course_id, course_name)
-        logger.debug(f"[ingest_course_documents] Phase 3/3 — ingesting Module items")
+        # Phase 1: Module items — primary source of truth.
+        # Files, assignments, discussions, pages, and external links are all
+        # discovered here with full module context (module name, anchor text).
+        # Running this first ensures every item gets its richest possible metadata.
+        logger.debug(f"[ingest_course_documents] Phase 1/2 — ingesting Module items")
         await self._ingest_module_items(course_id, course_name)
+
+        # Phase 2: Canvas Pages index — catch-all for instructor-created pages
+        # that are not linked from any module. Pages already visited during
+        # Phase 1 are in _seen_urls and will be skipped automatically.
+        logger.debug(f"[ingest_course_documents] Phase 2/2 — ingesting Canvas Pages (catch-all)")
+        await self._ingest_pages(course_id, course_name)
 
         logger.info(
             f"Course {course_name}: ingested {len(self.results)} documents, "
@@ -545,7 +551,18 @@ class DocumentIngester:
         logger.debug(f"[_scrape_canvas_page] Navigating to: {url}")
         try:
             await self._goto(url)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.0)  # slightly longer for React-heavy Canvas pages
+
+            # Save snapshot so module item visits are visible in debug_snapshots/
+            try:
+                snap_dir = Path(os.environ.get("DATA_DIR", "data")) / "debug_snapshots"
+                snap_dir.mkdir(parents=True, exist_ok=True)
+                safe_label = re.sub(r"[^\w\-]", "_", f"module_item_{title or url.split('/')[-1]}")[:80]
+                (snap_dir / f"{safe_label}.html").write_text(
+                    await self.page.content(), encoding="utf-8", errors="replace"
+                )
+            except Exception as _snap_err:
+                logger.debug(f"[_scrape_canvas_page] Snapshot save failed: {_snap_err}")
 
             # Resolve title from page if not provided
             if not title:
