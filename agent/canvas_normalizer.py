@@ -188,7 +188,7 @@ class CanvasNormalizer:
     def normalize_module(self, raw: dict, course: dict) -> CanvasObject:
         course_id = str(course.get("id", ""))
         title = raw.get("title", raw.get("name", ""))
-        url = raw.get("url", f"{course.get('url','')}/modules")
+        url = raw.get("url") or f"{course.get('url','')}/modules#{title}"
 
         obj = CanvasObject(
             id=make_object_id(course_id, ObjectType.MODULE.value, url or title),

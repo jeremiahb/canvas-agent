@@ -1524,7 +1524,16 @@ class CanvasCrawler:
         ChromaDB, and build the knowledge graph.
 
         Requires self.kb to be set (injected by api/main.py before crawl_all()).
+
+        The synchronous work (embedding generation, ChromaDB I/O) is offloaded
+        to a thread-pool executor so it does not block the async event loop.
         """
+        loop = asyncio.get_event_loop()
+        logger.info("[normalization] Starting normalization pass in executor")
+        await loop.run_in_executor(None, self._run_normalization_pass_sync)
+
+    def _run_normalization_pass_sync(self) -> None:
+        """Synchronous body of the normalization pass — runs in a thread executor."""
         from agent.canvas_normalizer import CanvasNormalizer
         from agent.graph_builder import GraphBuilder
         from agent.change_detector import ChangeDetector
@@ -1551,13 +1560,16 @@ class CanvasCrawler:
             except Exception as e:
                 logger.warning(f"[normalization] Failed for {course.get('name','?')}: {e}")
 
-        # Change detection + upsert
+        logger.info(f"[normalization] {len(all_objects)} objects normalized — running change detection")
+
+        # Change detection (reads existing objects from ChromaDB)
         changes = detector.detect_batch(all_objects, self.kb)
-        for obj in all_objects:
-            try:
-                self.kb.upsert_canvas_object(obj)
-            except Exception as e:
-                logger.warning(f"[normalization] upsert failed {obj.id}: {e}")
+
+        # Batch upsert — single embedding call for all objects
+        try:
+            self.kb.upsert_canvas_objects_batch(all_objects)
+        except Exception as e:
+            logger.error(f"[normalization] batch upsert failed: {e}", exc_info=True)
 
         # Store change records (as JSON in a simple collection)
         for chg in changes:

@@ -1016,6 +1016,57 @@ class KnowledgeBase:
         self.canvas_objects.upsert(ids=[obj_id], documents=[doc_text], metadatas=[meta])
         logger.debug(f"[kb.upsert_canvas_object] {obj_id} type={meta.get('object_type','?')}")
 
+    def upsert_canvas_objects_batch(self, objects: list) -> None:
+        """
+        Persist a list of CanvasObjects to ChromaDB in a single batched upsert call.
+
+        ChromaDB generates embeddings for all documents in one shot, which is
+        dramatically faster than calling upsert_canvas_object() in a loop
+        (~2-3 s per object vs. ~10-30 s for a full batch of 200 objects).
+
+        Objects are chunked to 100 per call to stay within ChromaDB's memory limits.
+        """
+        from agent.canvas_schema import canvas_object_to_dict
+
+        ids: list = []
+        docs: list = []
+        metas: list = []
+
+        for obj in objects:
+            try:
+                d = canvas_object_to_dict(obj)
+                obj_id = d.pop("id")
+                doc_text = (d.pop("main_content", "") or "")[:8000]
+                if not doc_text:
+                    doc_text = d.get("title", "") or obj_id
+                d.pop("raw_html", None)
+                meta: dict = {}
+                for k, v in d.items():
+                    if isinstance(v, (list, dict)):
+                        meta[k] = json.dumps(v)
+                    elif v is None:
+                        meta[k] = ""
+                    else:
+                        meta[k] = v
+                ids.append(obj_id)
+                docs.append(doc_text)
+                metas.append(meta)
+            except Exception as e:
+                logger.warning(f"[kb.upsert_canvas_objects_batch] prep failed for {getattr(obj, 'id', '?')}: {e}")
+
+        if not ids:
+            return
+
+        CHUNK = 100
+        for i in range(0, len(ids), CHUNK):
+            self.canvas_objects.upsert(
+                ids=ids[i:i + CHUNK],
+                documents=docs[i:i + CHUNK],
+                metadatas=metas[i:i + CHUNK],
+            )
+
+        logger.info(f"[kb.upsert_canvas_objects_batch] {len(ids)} objects upserted in {((len(ids)-1)//CHUNK)+1} batch(es)")
+
     def get_canvas_object(self, obj_id: str):
         """Fetch a single CanvasObject by ID, or None if not found."""
         from agent.canvas_schema import canvas_object_from_dict
