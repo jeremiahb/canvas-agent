@@ -48,6 +48,35 @@ def _zip_results(r: dict) -> list:
     return [{"id": ids[i], "document": docs[i], "metadata": metas[i]} for i in range(len(ids))]
 
 
+def _structured_to_text(s: dict) -> str:
+    """Convert structured_elements dict to a searchable plain-text summary."""
+    parts = []
+    for h in s.get("headings", []):
+        level = h.get("level", 2) if isinstance(h, dict) else 2
+        text = h.get("text", h) if isinstance(h, dict) else str(h)
+        parts.append(f"{'#' * level} {text}")
+    for tbl in s.get("tables", []):
+        if isinstance(tbl, list):
+            parts.append("[TABLE]\n" + "\n".join(" | ".join(str(c) for c in row) for row in tbl))
+        else:
+            parts.append(f"[TABLE]\n{tbl}")
+    for item in s.get("lists", []):
+        parts.append(f"• {item}")
+    for code in s.get("code_blocks", []):
+        parts.append(f"```\n{code[:500]}\n```")
+    # Slides
+    for slide in s.get("slides", []):
+        if isinstance(slide, dict):
+            parts.append(f"[Slide {slide.get('slide','')}] {slide.get('title','')} — {slide.get('body','')[:300]}")
+    # Spreadsheet schema
+    schema = s.get("schema", {})
+    if isinstance(schema, dict):
+        for sheet, info in schema.items():
+            cols = info.get("columns", []) if isinstance(info, dict) else []
+            parts.append(f"[Sheet: {sheet}] Columns: {', '.join(str(c) for c in cols)}")
+    return "\n\n".join(p for p in parts if p.strip())
+
+
 def _chunk_text(text: str, max_chars: int = 6000) -> list[str]:
     """
     Split text into semantically coherent chunks of at most max_chars.
@@ -236,8 +265,16 @@ class KnowledgeBase:
                         "course_id": course_id,
                         "course_name": course_name,
                         "source": doc.get("source", ""),
+                        "module_name": doc.get("module_name", ""),
                         "chunk": chunk_idx,
-                        "total_chunks": len(chunks),
+                        "chunk_count": len(chunks),
+                        # Intake pipeline classification metadata (populated when available)
+                        "content_type": doc.get("content_type", ""),
+                        "input_type": doc.get("input_type", ""),
+                        "intent": doc.get("intent", ""),
+                        "classifier_confidence": float(doc.get("classifier_confidence", 0.0)),
+                        "source_label": doc.get("source", ""),
+                        "canonical_url": doc.get("url", ""),
                     })
 
             if doc_ids:
@@ -687,7 +724,7 @@ class KnowledgeBase:
         if count == 0:
             return []
         where = _build_where(course_name=course_name, note_type=note_type)
-        kwargs: dict = {"include": ["documents", "metadatas", "ids"]}
+        kwargs: dict = {"include": ["documents", "metadatas"]}
         if where:
             kwargs["where"] = where
         try:
@@ -717,7 +754,7 @@ class KnowledgeBase:
         try:
             r = self.ai_notes.get(
                 where={"source_doc_id": source_doc_id},
-                include=["documents", "metadatas", "ids"],
+                include=["documents", "metadatas"],
             )
             return _zip_results(r)
         except Exception as e:
@@ -734,7 +771,7 @@ class KnowledgeBase:
                 where = {"$and": [{"chunk": 0}, {"course_name": course_name}]}
             else:
                 where = {"chunk": 0}
-            r = self.documents.get(where=where, include=["documents", "metadatas", "ids"])
+            r = self.documents.get(where=where, include=["documents", "metadatas"])
             return _zip_results(r)
         except Exception as e:
             logger.error(f"Error fetching document first chunks: {e}")
@@ -753,7 +790,7 @@ class KnowledgeBase:
         count = self.topics.count()
         if count == 0:
             return []
-        kwargs: dict = {"include": ["documents", "metadatas", "ids"]}
+        kwargs: dict = {"include": ["documents", "metadatas"]}
         if course_name:
             kwargs["where"] = {"course_name": course_name}
         try:
@@ -789,7 +826,7 @@ class KnowledgeBase:
         try:
             r = self.concepts.get(
                 where={"topic_id": topic_id},
-                include=["documents", "metadatas", "ids"],
+                include=["documents", "metadatas"],
             )
             return _zip_results(r)
         except Exception as e:
@@ -829,7 +866,7 @@ class KnowledgeBase:
             return []
         try:
             r = self.chat_history.get(
-                include=["documents", "metadatas", "ids"],
+                include=["documents", "metadatas"],
                 limit=min(n * 2, count),  # fetch extra then sort+trim
             )
             items = _zip_results(r)
@@ -838,3 +875,99 @@ class KnowledgeBase:
         except Exception as e:
             logger.error(f"Error fetching chat history: {e}")
             return []
+
+    # ------------------------------------------------------------------ #
+    #  Intake Pipeline Integration                                         #
+    # ------------------------------------------------------------------ #
+
+    def store_intake_record(self, record) -> str:
+        """
+        Store a normalized IntakeRecord from the intake pipeline.
+
+        - Skips 'ignore' records (login walls, media stubs, etc.)
+        - Skips exact duplicates (returns canonical ID)
+        - Chunks cleaned_text into the documents collection
+        - Also upserts a separate structured-elements summary document
+        - Returns the base unique_id
+        """
+        from agent.intake_pipeline import IntakeRecord  # lazy import avoids circular
+
+        if record.recommended_use == "ignore":
+            logger.debug(f"[kb.store] Skipping ignore-tagged record {record.unique_id}")
+            return record.unique_id
+
+        if record.dedup_result == "exact_duplicate":
+            logger.debug(f"[kb.store] Exact dup — skipping {record.unique_id}")
+            return record.dedup_canonical_id or record.unique_id
+
+        text_to_chunk = record.cleaned_text or record.raw_text
+        chunks = _chunk_text(text_to_chunk)
+
+        # Build the base metadata dict — ChromaDB requires scalar values only
+        base_meta: dict = {
+            "source_url":    record.canonical_source,
+            "canonical_url": record.canonical_source,
+            "referring_page": record.metadata.get("referring_page", ""),
+            "anchor_text":   record.metadata.get("anchor_text", ""),
+            "title":         str(record.metadata.get("title", "")),
+            "course_name":   record.metadata.get("course_name", ""),
+            "course_id":     record.metadata.get("course_id", ""),
+            "module_name":   record.metadata.get("module_name", ""),
+            "source_label":  record.metadata.get("source_label", ""),
+            "content_type":  record.content_type,
+            "input_type":    record.input_type,
+            "intent":        record.intent,
+            "processing_route": record.processing_route,
+            "quality_score": float(round(record.quality_score, 3)),
+            "trust_score":   float(round(record.trust_score, 3)),
+            "dedup_result":  record.dedup_result,
+            "word_count":    int(record.metadata.get("word_count", 0)),
+            "page_count":    int(record.metadata.get("page_count", 0)),
+            "slide_count":   int(record.metadata.get("slide_count", 0)),
+            "is_image_heavy": bool(record.metadata.get("is_image_heavy", False)),
+            "access_status": record.metadata.get("access_status", "public"),
+            "recommended_use": record.recommended_use,
+            "errors":        "; ".join(record.errors) if record.errors else "",
+        }
+
+        # Store text chunks
+        for i, chunk in enumerate(chunks):
+            chunk_id = f"{record.unique_id}_c{i}"
+            meta = {**base_meta, "chunk": i, "chunk_count": len(chunks)}
+            self.documents.upsert(ids=[chunk_id], documents=[chunk], metadatas=[meta])
+
+        # Store structured-elements summary as a separate searchable document
+        struct_text = _structured_to_text(record.structured_elements)
+        if struct_text.strip():
+            self.documents.upsert(
+                ids=[f"{record.unique_id}_struct"],
+                documents=[struct_text[:6000]],
+                metadatas=[{**base_meta, "chunk": -1, "chunk_count": 1, "is_structured": True}],
+            )
+
+        logger.debug(
+            f"[kb.store] Stored {record.unique_id} "
+            f"({len(chunks)} chunk(s), content_type={record.content_type}, "
+            f"quality={record.quality_score:.2f})"
+        )
+        return record.unique_id
+
+    def find_by_canonical_url(self, canonical_url: str) -> Optional[dict]:
+        """
+        Return the first document matching canonical_url, or None.
+        Used by the Deduplicator to detect previously-indexed content.
+        """
+        try:
+            r = self.documents.get(
+                where={"canonical_url": canonical_url},
+                include=["documents", "metadatas"],
+                limit=1,
+            )
+            if r.get("ids"):
+                return {
+                    "id": r["ids"][0],
+                    "cleaned_text": r["documents"][0] if r.get("documents") else "",
+                }
+        except Exception as e:
+            logger.debug(f"[kb.find_by_canonical_url] {e}")
+        return None
