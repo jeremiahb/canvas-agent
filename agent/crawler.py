@@ -1525,7 +1525,7 @@ class CanvasCrawler:
                 async def _fetch_quiz_detail(quiz: dict) -> None:
                     async with _quiz_sem:
                         try:
-                            quiz["details"] = await self.get_quiz_details(quiz["id"], cid)
+                            quiz["details"] = await self.get_quiz_details(quiz["quiz_url"], cid)
                             logger.debug(f"[crawl_all] Quiz details for {quiz.get('title','')!r} fetched")
                         except Exception as _qerr:
                             logger.warning(f"[crawl_all] Quiz details failed for {quiz.get('title','')!r}: {_qerr}")
