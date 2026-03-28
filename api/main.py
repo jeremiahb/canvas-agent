@@ -765,7 +765,8 @@ async def upload_document_file(
 
 
 _MAX_BULK_FILES = 50
-_MAX_ZIP_UNCOMPRESSED = 200 * 1024 * 1024  # 200 MB
+_MAX_ZIP_COMPRESSED_BYTES = 50 * 1024 * 1024   # 50 MB compressed read limit
+_MAX_ZIP_UNCOMPRESSED = 200 * 1024 * 1024       # 200 MB uncompressed guard
 
 
 @app.post("/api/documents/upload-bulk")
@@ -841,7 +842,9 @@ async def upload_documents_zip(
     if not is_zip:
         raise HTTPException(400, "File must be a .zip archive")
 
-    data = await file.read()
+    data = await file.read(_MAX_ZIP_COMPRESSED_BYTES + 1)
+    if len(data) > _MAX_ZIP_COMPRESSED_BYTES:
+        raise HTTPException(400, "ZIP file too large — maximum 50 MB compressed")
 
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
@@ -911,9 +914,7 @@ async def reindex_knowledge():
 
     async def _run_reindex():
         try:
-            with open(snapshot_path) as f:
-                knowledge = json.load(f)
-            total = kb.ingest_knowledge(knowledge)
+            total = kb.ingest_knowledge(str(snapshot_path))
             logger.info(f"[reindex] Done — {total} documents indexed from snapshot")
         except Exception as _e:
             logger.error(f"[reindex] Failed: {_e}")
