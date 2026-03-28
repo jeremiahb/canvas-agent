@@ -322,6 +322,79 @@ class KnowledgeBase:
                 )
                 total_docs += len(flag_ids)
 
+            # --- Discussions batch ---
+            disc_ids: list[str] = []
+            disc_texts: list[str] = []
+            disc_metas: list[dict] = []
+
+            for idx, disc in enumerate(course.get("discussions", [])):
+                slug = re.sub(r"\W+", "_", disc.get("title", ""))[:40]
+                disc_ids.append(f"discussion_{course_id}_{idx}_{slug}")
+                disc_texts.append((
+                    f"Discussion: {disc.get('title', '')}\n"
+                    f"Due: {disc.get('due_date', '')}\n"
+                    f"Points: {disc.get('point_value', '')}\n"
+                    f"{disc.get('body', '')}"
+                )[:6000])
+                disc_metas.append({
+                    "type": "discussion",
+                    "title": disc.get("title", ""),
+                    "course_id": course_id,
+                    "course_name": course_name,
+                    "due": disc.get("due_date", ""),
+                    "points": str(disc.get("point_value", "")),
+                    "is_graded": str(disc.get("is_graded", False)),
+                    "is_pinned": str(disc.get("is_pinned", False)),
+                    "url": disc.get("url", ""),
+                })
+
+            if disc_ids:
+                logger.debug(f"[ingest_knowledge] Upserting {len(disc_ids)} discussions for {course_name}")
+                self.course_content.upsert(
+                    ids=disc_ids,
+                    documents=disc_texts,
+                    metadatas=disc_metas,
+                )
+                total_docs += len(disc_ids)
+
+            # --- Quizzes batch ---
+            quiz_ids: list[str] = []
+            quiz_texts: list[str] = []
+            quiz_metas: list[dict] = []
+
+            for idx, quiz in enumerate(course.get("quizzes", [])):
+                slug = re.sub(r"\W+", "_", quiz.get("title", ""))[:40]
+                details = quiz.get("details") or {}
+                quiz_ids.append(f"quiz_{course_id}_{idx}_{slug}")
+                quiz_texts.append((
+                    f"Quiz: {quiz.get('title', '')}\n"
+                    f"Due: {quiz.get('due_date', '')}\n"
+                    f"Points: {quiz.get('point_value', '')}\n"
+                    f"Questions: {quiz.get('question_count', '')}\n"
+                    f"Time limit: {quiz.get('time_limit', '')}\n"
+                    f"Instructions: {details.get('instructions', '')}"
+                )[:6000])
+                quiz_metas.append({
+                    "type": "quiz",
+                    "title": quiz.get("title", ""),
+                    "course_id": course_id,
+                    "course_name": course_name,
+                    "due": str(quiz.get("due_date", "")),
+                    "points": str(quiz.get("point_value", "")),
+                    "question_count": str(quiz.get("question_count", "")),
+                    "time_limit": str(quiz.get("time_limit", "")),
+                    "url": quiz.get("url", ""),
+                })
+
+            if quiz_ids:
+                logger.debug(f"[ingest_knowledge] Upserting {len(quiz_ids)} quizzes for {course_name}")
+                self.course_content.upsert(
+                    ids=quiz_ids,
+                    documents=quiz_texts,
+                    metadatas=quiz_metas,
+                )
+                total_docs += len(quiz_ids)
+
             # --- Assignments batch ---
             assign_ids: list[str] = []
             assign_docs: list[str] = []

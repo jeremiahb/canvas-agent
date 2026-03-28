@@ -58,6 +58,16 @@ function makeApi(apiKey) {
         .then(checkAuth)
         .then((r) => r.json());
     },
+
+    uploadMultipleWithFields: (path, files, fields = {}) => {
+      const fd = new FormData();
+      files.forEach((f) => fd.append("files", f));
+      const url = new URL(`/api${path}`, window.location.origin);
+      Object.entries(fields).forEach(([k, v]) => v && url.searchParams.set(k, v));
+      return fetch(url.toString(), { method: "POST", headers: baseHeaders(), body: fd })
+        .then(checkAuth)
+        .then((r) => r.json());
+    },
   };
 }
 
@@ -752,6 +762,7 @@ function DocumentsPanel({ api }) {
   const [pasteText, setPasteText] = useState("");
   const [pasteCourse, setPasteCourse] = useState("");
   const [uploadFile, setUploadFile] = useState(null);
+  const [uploadFiles, setUploadFiles] = useState([]);
   const [uploadTitle, setUploadTitle] = useState("");
   const [uploadCourse, setUploadCourse] = useState("");
   const [saving, setSaving] = useState(false);
@@ -798,14 +809,26 @@ function DocumentsPanel({ api }) {
   };
 
   const saveFile = async () => {
-    if (!uploadFile || !uploadCourse.trim()) { setMsg("Select a file and enter the course name."); return; }
+    if (uploadFiles.length === 0 || !uploadCourse.trim()) {
+      setMsg("Select files and choose a course."); return;
+    }
     setSaving(true); setMsg("");
     try {
-      const res = await api.uploadWithFields("/documents/upload-file", uploadFile, {
-        course_name: uploadCourse, title: uploadTitle || undefined,
-      });
-      setMsg(res.message || "Uploaded.");
-      setUploadFile(null); setUploadTitle(""); setUploadCourse("");
+      const isZip = uploadFiles.length === 1 && uploadFiles[0].name.toLowerCase().endsWith(".zip");
+      let res;
+      if (isZip) {
+        res = await api.uploadWithFields("/documents/upload-zip", uploadFiles[0], { course_name: uploadCourse });
+        setMsg(`ZIP processed: ${res.processed} indexed, ${res.failed} failed.`);
+      } else if (uploadFiles.length === 1) {
+        res = await api.uploadWithFields("/documents/upload-file", uploadFiles[0], {
+          course_name: uploadCourse, title: uploadTitle || undefined,
+        });
+        setMsg(res.message || "Uploaded.");
+      } else {
+        res = await api.uploadMultipleWithFields("/documents/upload-bulk", uploadFiles, { course_name: uploadCourse });
+        setMsg(`Bulk upload: ${res.processed} indexed, ${res.failed} failed.`);
+      }
+      setUploadFile(null); setUploadFiles([]); setUploadTitle(""); setUploadCourse("");
       loadIndexed(selectedCourse);
     } catch (e) { setMsg("Failed: " + e.message); }
     setSaving(false);
@@ -849,7 +872,7 @@ function DocumentsPanel({ api }) {
           }}>
             {t === "indexed" ? `Course Documents (${indexedDocs.length})` :
              t === "flagged" ? `Flagged (${flagged.length})` :
-             t === "paste" ? "Paste Text" : "Upload File"}
+             t === "paste" ? "Paste Text" : "Upload Files"}
           </button>
         ))}
       </div>
@@ -943,20 +966,42 @@ function DocumentsPanel({ api }) {
       )}
 
       {docTab === "file" && (
-        <Section title="Upload PDF or Word File">
-          <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 14 }}>Upload a PDF or .docx file. Max 20 MB.</p>
-          <input type="file" accept=".pdf,.docx,.txt" onChange={(e) => setUploadFile(e.target.files[0])}
+        <Section title="Upload Course Materials">
+          <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 14 }}>
+            Upload PDFs, Word docs, PowerPoints, or a ZIP of course materials. Select multiple files at once or a single ZIP. Max 20 MB per file.
+          </p>
+          <input type="file" accept=".pdf,.docx,.pptx,.txt,.zip" multiple
+            onChange={(e) => {
+              const files = Array.from(e.target.files || []);
+              setUploadFiles(files);
+              setUploadFile(files[0] || null);
+            }}
             style={{ fontSize: 13, color: "#d1d5db", marginBottom: 8, display: "block" }} />
-          <input value={uploadTitle} onChange={(e) => setUploadTitle(e.target.value)}
-            placeholder="Document title (optional)" style={inputStyle} />
+          {uploadFiles.length > 0 && (
+            <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 8 }}>
+              {uploadFiles.length === 1 && uploadFiles[0].name.toLowerCase().endsWith(".zip")
+                ? `ZIP archive: ${uploadFiles[0].name}`
+                : uploadFiles.length === 1
+                  ? `1 file selected: ${uploadFiles[0].name}`
+                  : `${uploadFiles.length} files selected`}
+            </div>
+          )}
+          {uploadFiles.length === 1 && !uploadFiles[0].name.toLowerCase().endsWith(".zip") && (
+            <input value={uploadTitle} onChange={(e) => setUploadTitle(e.target.value)}
+              placeholder="Document title (optional)" style={inputStyle} />
+          )}
           <select value={uploadCourse} onChange={(e) => setUploadCourse(e.target.value)}
             style={{ ...inputStyle, marginTop: 8 }}>
             <option value="">Select course…</option>
             {courses.map((c) => <option key={c} value={c}>{c}</option>)}
           </select>
           {msg && <div style={{ fontSize: 12, color: msg.startsWith("Failed") ? "#ef4444" : "#22c55e", marginTop: 8 }}>{msg}</div>}
-          <Btn onClick={saveFile} disabled={saving || !uploadFile} style={{ marginTop: 10 }}>
-            {saving ? "Uploading…" : "Upload and Index"}
+          <Btn onClick={saveFile} disabled={saving || uploadFiles.length === 0} style={{ marginTop: 10 }}>
+            {saving ? "Uploading…" :
+              uploadFiles.length === 0 ? "Upload and Index" :
+              uploadFiles.length === 1 && uploadFiles[0].name.toLowerCase().endsWith(".zip") ? "Upload ZIP" :
+              uploadFiles.length === 1 ? "Upload 1 File" :
+              `Upload ${uploadFiles.length} Files`}
           </Btn>
         </Section>
       )}

@@ -26,7 +26,9 @@ import uuid
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from typing import Optional
+import io
+import zipfile
+from typing import List, Optional
 
 import re
 
@@ -760,6 +762,164 @@ async def upload_document_file(
         "doc_id": doc_id,
         "char_count": len(text),
     }
+
+
+_MAX_BULK_FILES = 50
+_MAX_ZIP_UNCOMPRESSED = 200 * 1024 * 1024  # 200 MB
+
+
+@app.post("/api/documents/upload-bulk")
+async def upload_documents_bulk(
+    course_name: str,
+    files: List[UploadFile] = File(...),
+    course_id: Optional[str] = None,
+):
+    """
+    Upload multiple files at once. Accepts up to 50 files (PDF, Word, PPTX, TXT).
+    Returns a summary of processed and failed files.
+    """
+    if len(files) > _MAX_BULK_FILES:
+        raise HTTPException(400, f"Too many files — maximum {_MAX_BULK_FILES} per upload")
+
+    results = []
+    processed = 0
+    failed = 0
+
+    for upload in files:
+        filename = upload.filename or ""
+        doc_title = Path(filename).stem or "Uploaded Document"
+        try:
+            data = await upload.read(MAX_DOCUMENT_UPLOAD_BYTES + 1)
+            if len(data) > MAX_DOCUMENT_UPLOAD_BYTES:
+                results.append({"file": filename, "status": "failed", "reason": "file too large (max 20 MB)"})
+                failed += 1
+                continue
+
+            content_type = upload.content_type or ""
+            text = extract_text_from_bytes(data, content_type, filename)
+            if not text.strip():
+                results.append({"file": filename, "status": "failed", "reason": "no text could be extracted"})
+                failed += 1
+                continue
+
+            doc_id = kb.add_manual_document(
+                title=doc_title,
+                text=text,
+                course_name=course_name,
+                course_id=course_id or "",
+                url="",
+            )
+            results.append({"file": filename, "status": "ok", "doc_id": doc_id, "chars": len(text)})
+            processed += 1
+        except Exception as _e:
+            logger.warning(f"[upload-bulk] Failed to process {filename!r}: {_e}")
+            results.append({"file": filename, "status": "failed", "reason": str(_e)})
+            failed += 1
+
+    if processed > 0:
+        brain.invalidate_upcoming_cache()
+        global _pipeline_task
+        if _pipeline_task is None or _pipeline_task.done():
+            _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
+
+    return {"processed": processed, "failed": failed, "results": results}
+
+
+@app.post("/api/documents/upload-zip")
+async def upload_documents_zip(
+    course_name: str,
+    file: UploadFile = File(...),
+    course_id: Optional[str] = None,
+):
+    """
+    Upload a ZIP file containing course materials. All PDF, Word, PPTX, and TXT files
+    inside will be extracted and indexed. Max 200 MB uncompressed total, 20 MB per file.
+    """
+    filename = file.filename or ""
+    content_type = file.content_type or ""
+    is_zip = filename.lower().endswith(".zip") or "zip" in content_type
+    if not is_zip:
+        raise HTTPException(400, "File must be a .zip archive")
+
+    data = await file.read()
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "Invalid or corrupted ZIP file")
+
+    # Guard against zip bombs before extracting anything
+    total_uncompressed = sum(info.file_size for info in zf.infolist())
+    if total_uncompressed > _MAX_ZIP_UNCOMPRESSED:
+        raise HTTPException(400, f"ZIP contents too large — maximum 200 MB uncompressed")
+
+    results = []
+    processed = 0
+    failed = 0
+
+    for info in zf.infolist():
+        entry_name = info.filename
+        # Skip directories and macOS metadata
+        if entry_name.endswith("/") or entry_name.startswith("__MACOSX/") or "/__MACOSX/" in entry_name:
+            continue
+        if info.file_size > MAX_DOCUMENT_UPLOAD_BYTES:
+            results.append({"file": entry_name, "status": "failed", "reason": "file too large (max 20 MB)"})
+            failed += 1
+            continue
+
+        doc_title = Path(entry_name).stem or entry_name
+        try:
+            entry_data = zf.read(entry_name)
+            ext = Path(entry_name).suffix.lower()
+            text = extract_text_from_bytes(entry_data, "", entry_name)
+            if not text.strip():
+                results.append({"file": entry_name, "status": "skipped", "reason": "no text extracted"})
+                continue
+
+            doc_id = kb.add_manual_document(
+                title=doc_title,
+                text=text,
+                course_name=course_name,
+                course_id=course_id or "",
+                url="",
+            )
+            results.append({"file": entry_name, "status": "ok", "doc_id": doc_id, "chars": len(text)})
+            processed += 1
+        except Exception as _e:
+            logger.warning(f"[upload-zip] Failed to process {entry_name!r}: {_e}")
+            results.append({"file": entry_name, "status": "failed", "reason": str(_e)})
+            failed += 1
+
+    if processed > 0:
+        brain.invalidate_upcoming_cache()
+        global _pipeline_task
+        if _pipeline_task is None or _pipeline_task.done():
+            _pipeline_task = asyncio.create_task(organizer.run_full_pipeline())
+
+    return {"processed": processed, "failed": failed, "results": results}
+
+
+@app.post("/api/crawl/reindex")
+async def reindex_knowledge():
+    """
+    Re-run ingest_knowledge() from the existing canvas_knowledge.json snapshot
+    without re-crawling Canvas. Useful after deploying new ingest paths.
+    """
+    snapshot_path = Path(os.environ.get("DATA_DIR", "/data")) / "knowledge" / "canvas_knowledge.json"
+    if not snapshot_path.exists():
+        raise HTTPException(404, "No knowledge snapshot found — run a crawl first")
+
+    async def _run_reindex():
+        try:
+            with open(snapshot_path) as f:
+                knowledge = json.load(f)
+            total = kb.ingest_knowledge(knowledge)
+            logger.info(f"[reindex] Done — {total} documents indexed from snapshot")
+        except Exception as _e:
+            logger.error(f"[reindex] Failed: {_e}")
+
+    asyncio.create_task(_run_reindex())
+    return {"message": "Re-indexing started from existing snapshot"}
 
 
 @app.get("/api/documents/list")
