@@ -1518,6 +1518,24 @@ class CanvasCrawler:
                 logger.warning(f"[crawl_all] Quizzes failed for {course['name']}: {e}")
                 course["quizzes"] = []
 
+            # Fetch quiz details concurrently — up to 3 pages in parallel
+            if course["quizzes"]:
+                _quiz_sem = asyncio.Semaphore(3)
+
+                async def _fetch_quiz_detail(quiz: dict) -> None:
+                    async with _quiz_sem:
+                        try:
+                            quiz["details"] = await self.get_quiz_details(quiz["id"], cid)
+                            logger.debug(f"[crawl_all] Quiz details for {quiz.get('title','')!r} fetched")
+                        except Exception as _qerr:
+                            logger.warning(f"[crawl_all] Quiz details failed for {quiz.get('title','')!r}: {_qerr}")
+                            quiz["details"] = {}
+
+                try:
+                    await asyncio.gather(*[_fetch_quiz_detail(q) for q in course["quizzes"]])
+                except Exception as _qall_err:
+                    logger.warning(f"[crawl_all] Quiz detail gather failed: {_qall_err}")
+
             # RF-Ingester-bypass: pass _polite_goto so the ingester uses
             # the same rate-limiting behaviour as the crawler.
             logger.info(f"  Ingesting documents for: {course['name']}")

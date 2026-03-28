@@ -278,8 +278,14 @@ class DocumentIngester:
         # Phase 2: Canvas Pages index — catch-all for instructor-created pages
         # that are not linked from any module. Pages already visited during
         # Phase 1 are in _seen_urls and will be skipped automatically.
-        logger.debug(f"[ingest_course_documents] Phase 2/2 — ingesting Canvas Pages (catch-all)")
+        logger.debug(f"[ingest_course_documents] Phase 2/3 — ingesting Canvas Pages (catch-all)")
         await self._ingest_pages(course_id, course_name)
+
+        # Phase 3: Files section — catch-all for files uploaded to the course
+        # file browser but not linked from any module or page. Dedup via
+        # _seen_urls means anything already downloaded above is silently skipped.
+        logger.debug(f"[ingest_course_documents] Phase 3/3 — ingesting Files section (catch-all)")
+        await self._ingest_files_page(course_id, course_name)
 
         logger.info(
             f"Course {course_name}: ingested {len(self.results)} documents, "
