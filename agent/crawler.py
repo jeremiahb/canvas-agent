@@ -140,10 +140,19 @@ class CanvasCrawler:
         logger.debug("[start] Launching Playwright")
         self._pw = await async_playwright().start()
 
-        # If PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH is set (e.g. pointing to the
-        # Nix-installed chromium on Railway), use it directly so we don't depend
-        # on Playwright's own downloaded browser binary which may be missing libs.
-        executable_path = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or None
+        # If PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH is set AND the path actually exists,
+        # use it directly (e.g. a system Chromium). If the path doesn't exist — which
+        # happens when migrating from Nixpacks to Docker — fall back to Playwright's
+        # own baked-in Chromium so the stale env var doesn't crash the crawler.
+        _raw_exec = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "").strip()
+        if _raw_exec and not Path(_raw_exec).exists():
+            logger.warning(
+                f"PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH={_raw_exec!r} does not exist — "
+                "falling back to Playwright's built-in Chromium. "
+                "Remove this env var from Railway Variables to silence this warning."
+            )
+            _raw_exec = ""
+        executable_path = _raw_exec or None
         logger.debug(f"[start] headless={headless} executable_path={executable_path!r}")
 
         browser = await self._pw.chromium.launch(
